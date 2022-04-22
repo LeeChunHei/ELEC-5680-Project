@@ -2,4 +2,4 @@
 
 --character_file data/characters/humanoid3d.txt
 --kin_ctrl motion
---motion_file data/motions/0005walking001.txt
+--motion_file data/motions/test.txt
