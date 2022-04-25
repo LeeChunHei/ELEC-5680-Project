@@ -1,0 +1,114 @@
+update world -> update agent -> check if need update -> _update_new_action
+
+_update_new_action -> if not first_step -> record_amp_obs
+
+def _record_amp_obs(self):
+    obs_expert = self._record_amp_obs_expert()
+    obs_agent = self._record_amp_obs_agent()
+    self.path.amp_obs_expert.append(obs_expert)
+    self.path.amp_obs_agent.append(obs_agent)
+    return
+
+
+#Expert observe code
+void cSceneImitateAMP::RecordAMPObsExpert(int agent_id, Eigen::VectorXd& out_data)
+{
+	const auto& kin_char = GetKinChar();
+	const cMotion* motion = SampleExpertMotion(kin_char.get());
+	double motion_duration = motion->GetDuration();
+	double rand_kin_time = mRand.RandDouble(0, motion_duration);
+
+	Eigen::VectorXd pose;
+	Eigen::VectorXd vel;
+	motion->CalcFrame(rand_kin_time, pose);
+	motion->CalcFrameVel(rand_kin_time, vel);
+
+	const auto& ctrl = GetController();
+	const cCtController* ct_ctrl = dynamic_cast<const cCtController*>(ctrl.get());
+	double dt = 1.0 / ct_ctrl->GetUpdateRate();
+	double prev_kin_time = rand_kin_time - dt;
+
+	Eigen::VectorXd prev_pose;
+	Eigen::VectorXd prev_vel;
+	motion->CalcFrame(prev_kin_time, prev_pose);
+	motion->CalcFrameVel(prev_kin_time, prev_vel);
+
+	double ground_h = kin_char->GetOriginPos()[1];
+
+	BuildAMPObs(agent_id, prev_pose, prev_vel, pose, vel, ground_h, out_data);
+}
+
+
+#rl_agent
+def _update_new_action(self):
+	s = self._record_state()
+	g = self._record_goal()
+
+	if not (self._is_first_step()):
+		r = self._record_reward()
+		self.path.rewards.append(r)
+	
+	a, logp = self._decide_action(s=s, g=g)
+	assert len(np.shape(a)) == 1
+	assert len(np.shape(logp)) <= 1
+
+	flags = self._record_flags()
+	self._apply_action(a)
+
+	self.path.states.append(s)
+	self.path.goals.append(g)
+	self.path.actions.append(a)
+	self.path.logps.append(logp)
+	self.path.flags.append(flags)
+	
+	if self._enable_draw():
+		self._log_val(s, g)
+	
+	return
+
+#amp agent
+def _update_new_action(self):
+	first_step = self._is_first_step()
+
+	super()._update_new_action()
+
+	if (not first_step):
+		self._record_amp_obs()
+
+	return
+
+
+#training 
+check if replay buffer initialized
+	get avg train return
+
+	loop num iter per update
+		get state mean
+		get state std
+		get goal mean
+		get goal std
+		_train_step()
+
+#_train_step()
+#update discriminator
+num_step = number of sample in replay buffer * step per batch / expert batch size
+loop num step:
+	obs_expert = expert_buffer sample batch size
+	obs_agent = agent buffer sample batch size
+	#_step_disc
+	cal gradient from disc_loss_tf
+	disc_loss_expert_tf = (0.5 * ((logits_tf - 1)^2).sum()).mean()
+	disc_loss_agent_tf =  (0.5 * ((logits_tf + 1)^2).sum()).mean()
+	disc_loss_tf = 0.5 * (disc_loss_agent_tf + disc_loss_expert_tf)
+
+	weight_decay = 0.0005
+	disc_loss_tf += weight_decay (do it in optimizer?)
+	disc_loss_tf += disc_logit_reg_weight * logit reg loss
+	disc_loss_tf += disc_grad_penalty * gradient
+
+	disc_stepsize = 0.00001
+	disc_momentum = 0.9
+	disc_opt = MomentumOptimizer(disc_stepsize, disc_momentum)
+#train step
+
+
