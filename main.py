@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 from datetime import datetime
@@ -7,6 +8,8 @@ import torch
 import env as envpy
 from ppo.PPO import PPO
 from discriminator import Discriminator
+
+from learning.amp_agent import AMPAgent
 
 class LoadArgFromFile(argparse.Action):
     def __call__(self, parser, namespace, values, option_string):
@@ -28,16 +31,44 @@ def train_loop():
 if __name__ == '__main__':
     #parse argument
     arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument('--arg_file', type=open, action=LoadArgFromFile, help='argment file path')
+    arg_parser.add_argument('--arg_file', type=open, default="./args/train_sfu_walking.txt", action=LoadArgFromFile, help='argment file path')
     arg_parser.add_argument('--motion_file', type=str, default='./motion_file/sfu_walking.txt', help='motion file path')
     arg_parser.add_argument('--draw', action=argparse.BooleanOptionalAction, default=False, help='render the environment')
     arg_parser.add_argument('--timestep', type=float, default=1/240, help='simulation time step')
     arg_parser.add_argument('--fall_contact_bodies', type=int, nargs="+")
+    arg_parser.add_argument('--agent_file', type=str, default='./agents/ct_agent_humanoid_amp.txt')
     args = arg_parser.parse_args()
     
     print(args)
 
     env = envpy.Env(args)
+
+    with open(args.agent_file) as agent_file:
+        agent_json = json.load(agent_file)
+    agent = AMPAgent(agent_json, env, None)
+    agent.output_dir = "./result"
+    agent.int_output_dir = "./result/int"
+
+    while True:
+        agent.update(None)
+        # env.update()
+
+        had_problem = env.sim_model.had_problem()
+        if not had_problem:
+            terminate = env.terminate()
+            if (terminate):
+                agent.end_episode()
+                agent.reset()
+                env.reset()
+        else:
+            agent.reset()
+            env.reset()
+
+    while True:
+        print("ended")
+        pass
+
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ####### initialize environment hyperparameters ######
@@ -138,6 +169,18 @@ if __name__ == '__main__':
         while not done:
             disc_agent_frame, disc_agent_vel = env.RecordAgentFrameAndVel()
             action = ppo_agent.select_action(state)
+            action = action.clip(min=[-4.79999999999, -1.00000000000, -1.00000000000, -1.00000000000, -4.00000000000,
+                                      -1.00000000000, -1.00000000000, -1.00000000000, -7.77999999999, -1.00000000000,
+                                      -1.000000000, -1.000000000, -7.850000000, -6.280000000, -1.000000000, -1.000000000,
+                                      -1.000000000, -12.56000000, -1.000000000, -1.000000000, -1.000000000, -4.710000000,
+                                      -7.779999999, -1.000000000, -1.000000000, -1.000000000, -7.850000000, -6.280000000,
+                                      -1.000000000, -1.000000000, -1.000000000, -8.460000000, -1.000000000, -1.000000000,
+                                      -1.000000000, -4.710000000],
+                                 max=[4.799999999, 1.000000000, 1.000000000, 1.000000000, 4.000000000, 1.000000000, 1.000000000,
+                                      1.000000000, 8.779999999, 1.000000000, 1.0000000, 1.0000000, 4.7100000, 6.2800000,
+                                      1.0000000, 1.0000000, 1.0000000, 12.560000, 1.0000000, 1.0000000, 1.0000000, 7.8500000,
+                                      8.7799999, 1.0000000, 1.0000000, 1.0000000, 4.7100000, 6.2800000, 1.0000000, 1.0000000,
+                                      1.0000000, 10.100000, 1.0000000, 1.0000000, 1.0000000, 7.8500000])
             env.step(action)
             next_state = env.RecordAgentObs()
             disc_agent_next_frame, disc_agent_next_vel = env.RecordAgentFrameAndVel()

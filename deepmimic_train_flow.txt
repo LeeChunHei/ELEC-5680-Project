@@ -112,3 +112,12 @@ loop num step:
 #train step
 
 
+{
+" ID": 0,
+ "Type": "AMP",
+ "ActionSpace": "Continuous",
+ "StateDim": 226,
+ "GoalDim": 0,
+ "ActionDim": 28,
+ "AMPObsDim": "226"
+}

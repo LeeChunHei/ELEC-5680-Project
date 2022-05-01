@@ -158,35 +158,49 @@ class Humanoid():
         self.ComputeAndApplyPDForces(target, self.max_force)
 
     def ActionToTarget(self, action: np.array):
-        max_len = 2 * math.pi
         target = []
         idx = 0
         for i in range(len(self.joint_idx)):
             if self.dof_count[i] == 4:
-                exp_map = action[idx:idx+3]
-                exp_len = np.linalg.norm(exp_map)   #l2 norm
-                if exp_len > max_len:
-                    exp_map = exp_map * (max_len / exp_len)
-                #convert exp_map to axis angle
-                theta = np.linalg.norm(exp_map)
-                if theta > 0.000001:
-                    axis = exp_map / theta
-                    norm_theta = math.fmod(theta, 2*math.pi)
-                    if norm_theta > math.pi:
-                        norm_theta = -2 * math.pi + norm_theta
-                    elif norm_theta < -math.pi:
-                        norm_theta = 2 * math.pi + norm_theta
-                    theta = norm_theta
-                else:
-                    axis = np.array([0,0,1])
-                    theta = 0
-                quat = self.client.getQuaternionFromAxisAngle(axis.tolist(), theta)
-                target.append(list(quat))
-                idx += 3
+                angle = action[idx]
+                axis = [action[idx+1], action[idx+2], action[idx+3]]
+                rot = self.client.getQuaternionFromAxisAngle(axis, angle)
+                target.append(list(rot))
+                idx += 4
             elif self.dof_count[i] == 1:
                 target.append([action[idx]])
                 idx += 1
         return target
+
+        # max_len = 2 * math.pi
+        # target = []
+        # idx = 0
+        # for i in range(len(self.joint_idx)):
+        #     if self.dof_count[i] == 4:
+        #         exp_map = action[idx:idx+3]
+        #         exp_len = np.linalg.norm(exp_map)   #l2 norm
+        #         if exp_len > max_len:
+        #             exp_map = exp_map * (max_len / exp_len)
+        #         #convert exp_map to axis angle
+        #         theta = np.linalg.norm(exp_map)
+        #         if theta > 0.000001:
+        #             axis = exp_map / theta
+        #             norm_theta = math.fmod(theta, 2*math.pi)
+        #             if norm_theta > math.pi:
+        #                 norm_theta = -2 * math.pi + norm_theta
+        #             elif norm_theta < -math.pi:
+        #                 norm_theta = 2 * math.pi + norm_theta
+        #             theta = norm_theta
+        #         else:
+        #             axis = np.array([0,0,1])
+        #             theta = 0
+        #         quat = self.client.getQuaternionFromAxisAngle(axis.tolist(), theta)
+        #         target.append(list(quat))
+        #         idx += 3
+        #     elif self.dof_count[i] == 1:
+        #         target.append([action[idx]])
+        #         idx += 1
+        # return target
 
     def ComputeAndApplyPDForces(self, target, max_force):
         scaling = 1
@@ -368,7 +382,7 @@ class Humanoid():
             for l in linkAngVelLocal:
                 state.append(l)
 
-        return state
+        return np.array(state)
 
     def terminates(self):
         #check if any non-allowed body part hits the ground
@@ -376,12 +390,6 @@ class Humanoid():
 
         base_pos, base_ori = self.client.getBasePositionAndOrientation(self.humanoid)
         terminates |= base_pos[1] > 5
-
-        vel = self.client.getBaseVelocity(self.humanoid)
-        lin_vel = np.array(vel[0])
-        ang_vel = np.array(vel[1])
-        terminates |= True if np.sum(np.abs(lin_vel) > 100) else False
-        terminates |= True if np.sum(np.abs(ang_vel) > 100) else False
 
         if not terminates:
             pts = self.client.getContactPoints()
@@ -400,6 +408,21 @@ class Humanoid():
 
         return terminates
 
+    def had_problem(self):
+        had_problem = False
+        vel = self.client.getBaseVelocity(self.humanoid)
+        lin_vel = np.array(vel[0])
+        ang_vel = np.array(vel[1])
+        had_problem |= True if np.sum(np.abs(lin_vel) > 100) else False
+        had_problem |= True if np.sum(np.abs(ang_vel) > 100) else False
+
+        base_pos, base_ori = self.client.getBasePositionAndOrientation(self.humanoid)
+        had_problem |= abs(base_pos[1]) > 5
+        had_problem |= abs(base_pos[0]) > 20
+        had_problem |= abs(base_pos[2]) > 20
+
+        return had_problem
+
     def GetStateDim(self):
         state = self.RecordObs()
         return len(state)
@@ -408,7 +431,7 @@ class Humanoid():
         dim = 0
         for i in self.dof_count:
             if i == 4:
-                dim += 3
+                dim += 4#3
             else: 
                 dim += 1
         return dim
@@ -641,6 +664,7 @@ class MotionCapture():
 
 class Env():
     def __init__(self, args):
+        self.draw = args.draw
         if args.draw:
             self.client = bc.BulletClient(p.GUI)
             self.client.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
@@ -665,6 +689,9 @@ class Env():
 
         self.mocap = MotionCapture(args.motion_file, self.kin_model)
 
+        self.sim_model_prev_frame = None
+        self.sim_model_curr_frame = None
+
     def reset(self):
         frame_time = random.uniform(self.timestep, self.mocap.duration-self.timestep*2)
         frame = self.mocap.SampleFrame(frame_time)
@@ -675,13 +702,17 @@ class Env():
             'base_lin_vel': frame_vel[:3],
             'base_ang_vel': frame_vel[3:6],
             'joint_pos': frame[7:],
-            'joint_vel': frame_vel[6:],
+            'joint_vel': [0]*self.sim_model.total_dof,#frame_vel[6:],
         }
         self.sim_model.InitPose(pose)
 
     def step(self, action):
+        frame, vel = self.RecordAgentFrameAndVel()
+        self.sim_model_prev_frame = [frame, vel]
         self.sim_model.ApplyAction(action)
         self.client.stepSimulation()
+        frame, vel = self.RecordAgentFrameAndVel()
+        self.sim_model_curr_frame = [frame, vel]
         return
 
     def RecordAgentObs(self):
@@ -709,7 +740,7 @@ class Env():
         obs += self.mocap.RecordObsPose(prev_frame, ground_h, ref_origin_rot)
         obs += self.mocap.RecordObsPose(next_frame, ground_h, ref_origin_rot)
         obs += self.mocap.RecordObsVel(prev_vel, ref_origin_rot)
-        obs += self.mocap.RecordObsVel(next_frame, ref_origin_rot)
+        obs += self.mocap.RecordObsVel(next_vel, ref_origin_rot)
 
         return obs
 
@@ -730,6 +761,103 @@ class Env():
     def GetDiscInputDim(self):
         expert_obs = self.RecordExpertDiscObs()
         return len(expert_obs)
+
+    def record_amp_obs_expert(self, id):
+        return self.RecordExpertDiscObs()
+
+    def record_amp_obs_agent(self, id):
+        prev_frame, prev_vel = self.sim_model_prev_frame
+        curr_frame, curr_vel = self.sim_model_curr_frame
+        return self.RecordAgentDiscObs(prev_frame, prev_vel, curr_frame, curr_vel)
+
+    def build_amp_obs_offset(self, id):
+        out_offset = [0] * self.GetDiscInputDim()
+        return np.array(out_offset)
+
+    def build_amp_obs_norm_groups(self, id):
+        groups = [0] * self.GetDiscInputDim()
+        groups[0] = -1
+        return groups
+
+    def build_amp_obs_scale(self, agent_id):
+        out_scale = [1] * self.GetDiscInputDim()
+        return np.array(out_scale)
+
+    def build_state_offset(self, id):
+        out_offset = [0] * self.GetStateDim()
+        return np.array(out_offset)
+
+    def build_state_norm_groups(self, id):
+        groups = [0] * self.GetStateDim()
+        groups[0] = -1
+        return groups
+
+    def build_state_scale(self, agent_id):
+        out_scale = [1] * self.GetStateDim()
+        return np.array(out_scale)
+
+    def build_goal_norm_groups(self, agent_id):
+        return np.array([])
+
+    def build_goal_offset(self, agent_id):
+        return np.array([])
+
+    def build_goal_scale(self, agent_id):
+        return np.array([])
+
+    def build_action_offset(self, agent_id):
+        # out_offset = [0] * self.GetActionDim()
+        out_offset = [
+            0.0000000000, 0.0000000000, 0.0000000000, -0.200000000, 0.0000000000, 0.0000000000,
+            0.0000000000, -0.200000000, 0.0000000000, 0.0000000000, 0.00000000, -0.2000000, 1.57000000,
+            0.00000000, 0.00000000, 0.00000000, -0.2000000, 0.00000000, 0.00000000, 0.00000000,
+            -0.2000000, -1.5700000, 0.00000000, 0.00000000, 0.00000000, -0.2000000, 1.57000000,
+            0.00000000, 0.00000000, 0.00000000, -0.2000000, 0.00000000, 0.00000000, 0.00000000,
+            -0.2000000, -1.5700000
+        ]
+        return np.array(out_offset)
+
+    def build_action_scale(self, agent_id):
+        # out_scale = [1] * self.GetActionDim()
+        #see cCtCtrlUtil::BuildOffsetScalePDPrismatic and
+        #see cCtCtrlUtil::BuildOffsetScalePDSpherical
+        out_scale = [
+            0.20833333333333, 1.00000000000000, 1.00000000000000, 1.00000000000000, 0.25000000000000,
+            1.00000000000000, 1.00000000000000, 1.00000000000000, 0.12077294685990, 1.00000000000000,
+            1.000000000000, 1.000000000000, 0.159235668789, 0.159235668789, 1.000000000000,
+            1.000000000000, 1.000000000000, 0.079617834394, 1.000000000000, 1.000000000000,
+            1.000000000000, 0.159235668789, 0.120772946859, 1.000000000000, 1.000000000000,
+            1.000000000000, 0.159235668789, 0.159235668789, 1.000000000000, 1.000000000000,
+            1.000000000000, 0.107758620689, 1.000000000000, 1.000000000000, 1.000000000000,
+            0.159235668789
+        ]
+        return np.array(out_scale)
+
+    def build_action_bound_min(self, agent_id):
+        #see cCtCtrlUtil::BuildBoundsPDSpherical
+        # out_scale = [-1] * self.get_action_size(agent_id)
+        out_scale = [
+            -4.79999999999, -1.00000000000, -1.00000000000, -1.00000000000, -4.00000000000,
+            -1.00000000000, -1.00000000000, -1.00000000000, -7.77999999999, -1.00000000000,
+            -1.000000000, -1.000000000, -7.850000000, -6.280000000, -1.000000000, -1.000000000,
+            -1.000000000, -12.56000000, -1.000000000, -1.000000000, -1.000000000, -4.710000000,
+            -7.779999999, -1.000000000, -1.000000000, -1.000000000, -7.850000000, -6.280000000,
+            -1.000000000, -1.000000000, -1.000000000, -8.460000000, -1.000000000, -1.000000000,
+            -1.000000000, -4.710000000
+        ]
+
+        return out_scale
+
+    def build_action_bound_max(self, agent_id):
+        # out_scale = [1] * self.get_action_size(agent_id)
+        out_scale = [
+            4.799999999, 1.000000000, 1.000000000, 1.000000000, 4.000000000, 1.000000000, 1.000000000,
+            1.000000000, 8.779999999, 1.000000000, 1.0000000, 1.0000000, 4.7100000, 6.2800000,
+            1.0000000, 1.0000000, 1.0000000, 12.560000, 1.0000000, 1.0000000, 1.0000000, 7.8500000,
+            8.7799999, 1.0000000, 1.0000000, 1.0000000, 4.7100000, 6.2800000, 1.0000000, 1.0000000,
+            1.0000000, 10.100000, 1.0000000, 1.0000000, 1.0000000, 7.8500000
+        ]
+        return out_scale
 
 if __name__ == '__main__':
     class a():

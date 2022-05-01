@@ -1,0 +1,780 @@
+import copy
+import imp
+import inspect
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+import math
+import numpy as np
+from enum import Enum
+import time
+
+def lerp(x, y, t):
+    return (1-t) * x + t*y
+
+class Mode(Enum):
+    TRAIN = 0
+    TEST = 1
+    TRAIN_END = 2
+
+class PPO():
+
+    NAME = "PPO"
+    EPOCHS_KEY = "Epochs"
+    BATCH_SIZE_KEY = "BatchSize"
+    RATIO_CLIP_KEY = "RatioClip"
+    NORM_ADV_CLIP_KEY = "NormAdvClip"
+    TD_LAMBDA_KEY = "TDLambda"
+    TAR_CLIP_FRAC = "TarClipFrac"
+    
+    ADV_EPS = 1e-5
+
+    ITERS_PER_UPDATE = "ItersPerUpdate"
+    DISCOUNT_KEY = "Discount"
+    MINI_BATCH_SIZE_KEY = "MiniBatchSize"
+    REPLAY_BUFFER_SIZE_KEY = "ReplayBufferSize"
+    INIT_SAMPLES_KEY = "InitSamples"
+    NORMALIZER_SAMPLES_KEY = "NormalizerSamples"
+
+    OUTPUT_ITERS_KEY = "OutputIters"
+    INT_OUTPUT_ITERS_KEY = "IntOutputIters"
+    TEST_EPISODES_KEY = "TestEpisodes"
+
+    EXP_ANNEAL_SAMPLES_KEY = "ExpAnnealSamples"
+    EXP_PARAM_BEG_KEY = "ExpParamsBeg"
+    EXP_PARAM_END_KEY = "ExpParamsEnd"
+
+    def __init__(self, json_data, writer):
+        self.exp_action = False
+        
+        self.writer = writer
+        self.mode = self.Mode.TRAIN
+
+        self.enable_training = True
+        self.path = Path()
+        self.iter = int(0)
+        self.start_time = time.time()
+
+        self.iters_per_update = int(1)
+        self.discount = 0.95
+        self.mini_batch_size = int(32)
+        self.replay_buffer_size = int(50000)
+        self.init_samples = int(1000)
+        self.normalizer_samples = np.inf
+        # self.local_mini_batch_size = self.mini_batch_size
+        self.need_normalizer_update = True
+        self.total_sample_count = 0
+
+        self.output_dir = ""
+        self.int_output_dir = ""
+        self.output_iters = 100
+        self.int_output_iters = 100
+        
+        self.train_return = 0.0
+        self.test_episodes = int(0)
+        self.test_episode_count = int(0)
+        self.test_return = 0.0
+        self.avg_test_return = 0.0
+        
+        self.exp_anneal_samples = 320000
+        self.exp_params_beg = ExpParams()
+        self.exp_params_end = ExpParams()
+        self.exp_params_curr = ExpParams()
+
+        self.load_param(json_data)
+        self.build_replay_buffer(self.replay_buffer_size)
+        self.build_normalizers()
+        self.build_bounds()
+        self.reset()
+
+        self.build_net(json_data)
+        self.build_losses(json_data) #in upper clss
+        self.build_solvers(json_data) #in upper class
+
+        self.init_normalizers()
+
+    def load_param(self, json_data):
+        if (self.ITERS_PER_UPDATE in json_data):
+            self.iters_per_update = int(json_data[self.ITERS_PER_UPDATE])
+                    
+        if (self.DISCOUNT_KEY in json_data):
+            self.discount = json_data[self.DISCOUNT_KEY]
+        
+        if (self.MINI_BATCH_SIZE_KEY in json_data):
+            self.mini_batch_size = int(json_data[self.MINI_BATCH_SIZE_KEY])
+            
+        if (self.REPLAY_BUFFER_SIZE_KEY in json_data):
+            self.replay_buffer_size = int(json_data[self.REPLAY_BUFFER_SIZE_KEY])
+            
+        if (self.INIT_SAMPLES_KEY in json_data):
+            self.init_samples = int(json_data[self.INIT_SAMPLES_KEY])
+
+        if (self.NORMALIZER_SAMPLES_KEY in json_data):
+            self.normalizer_samples = int(json_data[self.NORMALIZER_SAMPLES_KEY])
+
+        if (self.OUTPUT_ITERS_KEY in json_data):
+            self.output_iters = json_data[self.OUTPUT_ITERS_KEY]
+
+        if (self.INT_OUTPUT_ITERS_KEY in json_data):
+            self.int_output_iters = json_data[self.INT_OUTPUT_ITERS_KEY]
+            
+        if (self.TEST_EPISODES_KEY in json_data):
+            self.test_episodes = int(json_data[self.TEST_EPISODES_KEY])
+
+        if (self.EXP_ANNEAL_SAMPLES_KEY in json_data):
+            self.exp_anneal_samples = json_data[self.EXP_ANNEAL_SAMPLES_KEY]
+
+        if (self.EXP_PARAM_BEG_KEY in json_data):
+            self.exp_params_beg.load(json_data[self.EXP_PARAM_BEG_KEY])
+
+        if (self.EXP_PARAM_END_KEY in json_data):
+            self.exp_params_end.load(json_data[self.EXP_PARAM_END_KEY])
+        
+        num_procs = 1#MPIUtil.get_num_procs()
+        self.replay_buffer_size = int(np.ceil(self.replay_buffer_size / num_procs))
+
+        self.local_mini_batch_size = int(np.ceil(self.mini_batch_size / num_procs))
+        self.local_mini_batch_size = np.maximum(self.local_mini_batch_size, 1)
+        self.mini_batch_size = self.local_mini_batch_size * num_procs
+        
+        assert(self.exp_params_beg.noise == self.exp_params_end.noise) # noise std should not change
+        self.exp_params_curr = copy.deepcopy(self.exp_params_beg)
+        self.exp_params_end.noise = self.exp_params_beg.noise
+
+        self._need_normalizer_update = self.normalizer_samples > 0
+
+        self.val_min, self.val_max = self._calc_val_bounds(self.discount)
+        self.val_fail, self.val_succ = self._calc_term_vals(self.discount)
+
+        self.epochs = 1 if (self.EPOCHS_KEY not in json_data) else json_data[self.EPOCHS_KEY]
+        self.batch_size = 1024 if (self.BATCH_SIZE_KEY not in json_data) else json_data[self.BATCH_SIZE_KEY]
+        self.ratio_clip = 0.2 if (self.RATIO_CLIP_KEY not in json_data) else json_data[self.RATIO_CLIP_KEY]
+        self.norm_adv_clip = 5 if (self.NORM_ADV_CLIP_KEY not in json_data) else json_data[self.NORM_ADV_CLIP_KEY]
+        self.td_lambda = 0.95 if (self.TD_LAMBDA_KEY not in json_data) else json_data[self.TD_LAMBDA_KEY]
+        self.tar_clip_frac = -1 if (self.TAR_CLIP_FRAC not in json_data) else json_data[self.TAR_CLIP_FRAC]
+
+        num_procs = 1#MPIUtil.get_num_procs()
+        self._local_batch_size = int(np.ceil(self.batch_size / num_procs))
+        min_replay_size = 2 * self._local_batch_size # needed to prevent buffer overflow
+        assert(self.replay_buffer_size > min_replay_size)
+
+        self.replay_buffer_size = np.maximum(min_replay_size, self.replay_buffer_size)
+
+        return
+
+    def build_net(self, json_data):
+        pass
+
+    def build_losses(self, json_data):
+        pass
+
+    def build_solvers(self, json_data):
+        pass
+
+    def init_normalizers(self):
+        self._s_norm.update()
+        self._g_norm.update()
+        self._a_norm.update()
+
+    def build_replay_buffer(self, buffer_size):
+        num_procs = 1#MPIUtil.get_num_procs()
+        buffer_size = int(buffer_size / num_procs)
+        self.replay_buffer = ReplayBuffer(buffer_size=buffer_size)
+        self.replay_buffer_initialized = False
+
+    def build_normalizers(self):
+        self._s_norm = Normalizer(self.get_state_size(), self.world.env.build_state_norm_groups(self.id))
+        self._s_norm.set_mean_std(-self.world.env.build_state_offset(self.id), 
+                                 1 / self.world.env.build_state_scale(self.id))
+
+        self._g_norm = Normalizer(self.get_goal_size(), self.world.env.build_goal_norm_groups(self.id))
+        self._g_norm.set_mean_std(-self.world.env.build_goal_offset(self.id), 
+                                 1 / self.world.env.build_goal_scale(self.id))
+
+        self._a_norm = Normalizer(self.world.env.get_action_size())
+        self._a_norm.set_mean_std(-self.world.env.build_action_offset(self.id), 
+                                 1 / self.world.env.build_action_scale(self.id))
+        return
+
+    def build_bounds(self):
+        self._a_bound_min = self.world.env.build_action_bound_min(self.id)
+        self._a_bound_max = self.world.env.build_action_bound_max(self.id)
+        return
+
+    def reset(self):
+        self.path.clear()
+        return
+
+    def _calc_val_bounds(self, discount):
+        r_min = self.world.env.get_reward_min(self.id)
+        r_max = self.world.env.get_reward_max(self.id)
+        assert(r_min <= r_max)
+
+        val_min = r_min / ( 1.0 - discount)
+        val_max = r_max / ( 1.0 - discount)
+        return val_min, val_max
+
+class Normalizer(object):
+    CHECK_SYNC_COUNT = 50000 # check synchronization after a certain number of entries
+
+    # these group IDs must be the same as those in CharController.h
+    NORM_GROUP_SINGLE = 0
+    NORM_GROUP_NONE = -1
+
+    class Group(object):
+        def __init__(self, id, indices):
+            self.id = id
+            self.indices = indices
+            return
+
+    def __init__(self, size, groups_ids=None, eps=0.02, clip=np.inf):
+        self.eps = eps
+        self.clip = clip
+        self.mean = np.zeros(size)
+        self.mean_sq = np.zeros(size)
+        self.std = np.ones(size)
+        self.count = 0
+        self.groups = self._build_groups(groups_ids)
+
+        self.new_count = 0
+        self.new_sum = np.zeros_like(self.mean)
+        self.new_sum_sq = np.zeros_like(self.mean_sq)
+        return
+
+    def record(self, x):
+        size = self.get_size()
+        is_array = isinstance(x, np.ndarray)
+        if not is_array:
+            assert(size == 1)
+            x = np.array([[x]])
+
+        assert x.shape[-1] == size, \
+            print('Normalizer shape mismatch, expecting size {:d}, but got {:d}'.format(size, x.shape[-1]))
+        x = np.reshape(x, [-1, size])
+
+        self.new_count += x.shape[0]
+        self.new_sum += np.sum(x, axis=0)
+        self.new_sum_sq += np.sum(np.square(x), axis=0)
+        return
+
+    def update(self):
+        new_count = self.new_count#MPIUtil.reduce_sum(self.new_count)
+        new_sum = self.new_sum#MPIUtil.reduce_sum(self.new_sum)
+        new_sum_sq = self.new_sum_sq#MPIUtil.reduce_sum(self.new_sum_sq)
+
+        new_total = self.count + new_count
+        if (self.count // self.CHECK_SYNC_COUNT != new_total // self.CHECK_SYNC_COUNT):
+            assert self.check_synced(), print('Normalizer parameters desynchronized')
+
+        if new_count > 0:
+            new_mean = self._process_group_data(new_sum / new_count, self.mean)
+            new_mean_sq = self._process_group_data(new_sum_sq / new_count, self.mean_sq)
+            w_old = float(self.count) / new_total
+            w_new = float(new_count) / new_total
+
+            self.mean = w_old * self.mean + w_new * new_mean
+            self.mean_sq = w_old * self.mean_sq + w_new * new_mean_sq
+            self.count = new_total
+            self.std = self.calc_std(self.mean, self.mean_sq)
+
+            self.new_count = 0
+            self.new_sum.fill(0)
+            self.new_sum_sq.fill(0)
+
+        return
+
+    def get_size(self):
+        return self.mean.size
+
+    def set_mean_std(self, mean, std):
+        size = self.get_size()
+        is_array = isinstance(mean, np.ndarray) and isinstance(std, np.ndarray)
+        
+        if not is_array:
+            assert(size == 1)
+            mean = np.array([mean])
+            std = np.array([std])
+
+        assert len(mean) == size and len(std) == size, \
+            print('Normalizer shape mismatch, expecting size {:d}, but got {:d} and {:d}'.format(size, len(mean), len(std)))
+        
+        self.mean = mean
+        self.std = std
+        self.mean_sq = self.calc_mean_sq(self.mean, self.std)
+        return
+
+    def normalize(self, x):
+        norm_x = (x - self.mean) / self.std
+        norm_x = np.clip(norm_x, -self.clip, self.clip)
+        return norm_x
+
+    def unnormalize(self, norm_x):
+        x = norm_x * self.std + self.mean
+        return x
+
+    def calc_std(self, mean, mean_sq):
+        var = mean_sq - np.square(mean)
+        # some time floating point errors can lead to small negative numbers
+        var = np.maximum(var, 0)
+        std = np.sqrt(var)
+        std = np.maximum(std, self.eps)
+        return std
+
+    def calc_mean_sq(self, mean, std):
+        return np.square(std) + np.square(self.mean)
+
+    def check_synced(self):
+        synced = True
+        # if MPIUtil.is_root_proc():
+        #     vars = np.concatenate([self.mean, self.mean_sq])
+        #     MPIUtil.bcast(vars)
+        # else:
+        #     vars_local = np.concatenate([self.mean, self.mean_sq])
+        #     vars_root = np.empty_like(vars_local)
+        #     MPIUtil.bcast(vars_root)
+        #     synced = (vars_local == vars_root).all()
+        return synced
+
+    def _build_groups(self, groups_ids):
+        groups = []
+        if groups_ids is None:
+            curr_id = self.NORM_GROUP_SINGLE
+            curr_list = np.arange(self.get_size()).astype(np.int32)
+            groups.append(self.Group(curr_id, curr_list))
+        else:
+            ids = np.unique(groups_ids)
+            for id in ids:
+                curr_list = np.nonzero(groups_ids == id)[0].astype(np.int32)
+                groups.append(self.Group(id, curr_list))
+
+        return groups
+
+    def _process_group_data(self, new_data, old_data):
+        proc_data = new_data.copy()
+        for group in self.groups:
+            if group.id == self.NORM_GROUP_NONE:
+                proc_data[group.indices] = old_data[group.indices]
+            elif group.id != self.NORM_GROUP_SINGLE:
+                avg = np.mean(new_data[group.indices])
+                proc_data[group.indices] = avg
+        return proc_data
+
+class ReplayBuffer(object):
+    TERMINATE_KEY = 'terminate'
+    PATH_START_KEY = 'path_start'
+    PATH_END_KEY = 'path_end'
+
+    def __init__(self, buffer_size):
+        assert buffer_size > 0
+
+        self.buffer_size = buffer_size
+        self.total_count = 0
+        self.buffer_head = 0
+        self.buffer_tail = -1
+        self.num_paths = 0
+        self._sample_buffers = dict()
+        self.buffers = None
+
+        self.clear()
+        return
+
+    def sample(self, n):
+        curr_size = self.get_current_size()
+        assert curr_size > 0
+
+        idx = np.empty(n, dtype=int)
+        # makes sure that the end states are not sampled
+        for i in range(n):
+            while True:
+                curr_idx = np.random.randint(0, curr_size, size=1)[0]
+                curr_idx += self.buffer_tail
+                curr_idx = np.mod(curr_idx, self.buffer_size)
+
+                if not self.is_path_end(curr_idx):
+                    break
+            idx[i] = curr_idx
+
+        return idx
+
+    def sample_filtered(self, n, key):
+        assert key in self._sample_buffers
+        curr_buffer = self._sample_buffers[key]
+        idx = curr_buffer.sample(n)
+        return idx
+
+    def count_filtered(self, key):
+        curr_buffer = self._sample_buffers[key]
+        return curr_buffer.count
+
+    def get(self, key, idx):
+        return self.buffers[key][idx]
+
+    def get_all(self, key):
+        return self.buffers[key]
+
+    def get_idx_filtered(self, key):
+        assert key in self._sample_buffers
+        curr_buffer = self._sample_buffers[key]
+        idx = curr_buffer.slot_to_idx[:curr_buffer.count]
+        return idx
+    
+    def get_path_start(self, idx):
+        return self.buffers[self.PATH_START_KEY][idx]
+
+    def get_path_end(self, idx):
+        return self.buffers[self.PATH_END_KEY][idx]
+
+    def get_pathlen(self, idx):
+        is_array = isinstance(idx, np.ndarray) or isinstance(idx, list)
+        if not is_array:
+            idx = [idx]
+
+        n = len(idx)
+        start_idx = self.get_path_start(idx)
+        end_idx = self.get_path_end(idx)
+        pathlen = np.empty(n, dtype=int)
+
+        for i in range(n):
+            curr_start = start_idx[i]
+            curr_end = end_idx[i]
+            if curr_start < curr_end:
+                curr_len = curr_end - curr_start
+            else:
+                curr_len = self.buffer_size - curr_start + curr_end
+            pathlen[i] = curr_len
+
+        if not is_array:
+            pathlen = pathlen[0]
+
+        return pathlen
+
+    def is_valid_path(self, idx):
+        start_idx = self.get_path_start(idx)
+        valid = start_idx != -1
+        return valid
+
+    def store(self, path):
+        start_idx = -1
+        n = path.pathlength()
+        
+        if (n > 0):
+            assert path.is_valid()
+
+            if path.check_vals():
+                if self.buffers is None:
+                    self._init_buffers(path)
+
+                idx = self._request_idx(n + 1)
+                self._store_path(path, idx)
+                self._add_sample_buffers(idx)
+
+                self.num_paths += 1
+                self.total_count += n + 1
+                start_idx = idx[0]
+            else:
+                print('Invalid path data value detected')
+        
+        return start_idx
+
+    def clear(self):
+        self.buffer_head = 0
+        self.buffer_tail = -1
+        self.num_paths = 0
+
+        for key in self._sample_buffers:
+            self._sample_buffers[key].clear()
+        return
+
+    def get_next_idx(self, idx):
+        next_idx = np.mod(idx + 1, self.buffer_size)
+        return next_idx
+
+    def is_terminal_state(self, idx):
+        terminate_flags = self.buffers[self.TERMINATE_KEY][idx]
+        terminate = terminate_flags != Env.Terminate.Null.value
+        is_end = self.is_path_end(idx)
+        terminal_state = np.logical_and(terminate, is_end)
+        return terminal_state
+
+    def check_terminal_flag(self, idx, flag):
+        terminate_flags = self.buffers[self.TERMINATE_KEY][idx]
+        terminate = terminate_flags == flag.value
+        return terminate
+
+    def is_path_end(self, idx):
+        is_end = self.buffers[self.PATH_END_KEY][idx] == idx
+        return is_end
+
+    def add_filter_key(self, key):
+        assert self.get_current_size() == 0
+        if key not in self._sample_buffers:
+            self._sample_buffers[key] = SampleBuffer(self.buffer_size)
+        return
+
+    def get_current_size(self):
+        if self.buffer_tail == -1:
+            return 0
+        elif self.buffer_tail < self.buffer_head:
+            return self.buffer_head - self.buffer_tail
+        else:
+            return self.buffer_size - self.buffer_tail + self.buffer_head
+
+    def _check_flags(self, key, flags):
+        return (flags & key) == key
+
+    def _add_sample_buffers(self, idx):
+        flags = self.buffers['flags']
+        for key in self._sample_buffers:
+            curr_buffer = self._sample_buffers[key]
+            filter_idx = [i for i in idx if (self._check_flags(key, flags[i]) and not self.is_path_end(i))]
+            curr_buffer.add(filter_idx)
+        return
+
+    def _free_sample_buffers(self, idx):
+        for key in self._sample_buffers:
+            curr_buffer = self._sample_buffers[key]
+            curr_buffer.free(idx)    
+        return
+
+    def _init_buffers(self, path):
+        self.buffers = dict()
+        self.buffers[self.PATH_START_KEY] = -1 * np.ones(self.buffer_size, dtype=int)
+        self.buffers[self.PATH_END_KEY] = -1 * np.ones(self.buffer_size, dtype=int)
+
+        for key in dir(path):
+            val = getattr(path, key)
+            if not key.startswith('__') and not inspect.ismethod(val):
+                if key == self.TERMINATE_KEY:
+                    self.buffers[self.TERMINATE_KEY] = np.zeros(shape=[self.buffer_size], dtype=int)
+                else:
+                    val_type = type(val[0])
+                    is_array = val_type == np.ndarray
+                    if is_array:
+                        shape = [self.buffer_size, val[0].shape[0]]
+                        dtype = val[0].dtype
+                    else:
+                        shape = [self.buffer_size]
+                        dtype = val_type
+                    
+                    self.buffers[key] = np.zeros(shape, dtype=dtype)
+        return
+
+    def _request_idx(self, n):
+        assert n + 1 < self.buffer_size # bad things can happen if path is too long
+
+        remainder = n
+        idx = []
+
+        start_idx = self.buffer_head
+        while remainder > 0:
+            end_idx = np.minimum(start_idx + remainder, self.buffer_size)
+            remainder -= (end_idx - start_idx)
+
+            free_idx = list(range(start_idx, end_idx))
+            self._free_idx(free_idx)
+            idx += free_idx
+            start_idx = 0
+
+        self.buffer_head = (self.buffer_head + n) % self.buffer_size
+        return idx
+
+    def _free_idx(self, idx):
+        assert(idx[0] <= idx[-1])
+        n = len(idx)
+        if self.buffer_tail != -1:
+            update_tail = idx[0] <= idx[-1] and idx[0] <= self.buffer_tail and idx[-1] >= self.buffer_tail
+            update_tail |= idx[0] > idx[-1] and (idx[0] <= self.buffer_tail or idx[-1] >= self.buffer_tail)
+            
+            if update_tail:
+                i = 0
+                while i < n:
+                    curr_idx = idx[i]
+                    if self.is_valid_path(curr_idx):
+                        start_idx = self.get_path_start(curr_idx)
+                        end_idx = self.get_path_end(curr_idx)
+                        pathlen = self.get_pathlen(curr_idx)
+
+                        if start_idx < end_idx:
+                            self.buffers[self.PATH_START_KEY][start_idx:end_idx + 1] = -1
+                            self._free_sample_buffers(list(range(start_idx, end_idx + 1)))
+                        else:
+                            self.buffers[self.PATH_START_KEY][start_idx:self.buffer_size] = -1
+                            self._free_sample_buffers(list(range(start_idx, self.buffer_size)))
+                            self._free_sample_buffers(list(range(0, end_idx + 1)))
+                        
+                        self.num_paths -= 1
+                        i += pathlen + 1
+                        self.buffer_tail = (end_idx + 1) % self.buffer_size;
+                    else:
+                        i += 1
+        else:
+            self.buffer_tail = idx[0]
+        return
+
+    def _store_path(self, path, idx):
+        n = path.pathlength()
+        for key, data in self.buffers.items():
+            if key != self.PATH_START_KEY and key != self.PATH_END_KEY and key != self.TERMINATE_KEY:
+                val = getattr(path, key)
+                val_len = len(val)
+                assert val_len == n or val_len == n + 1
+                data[idx[:val_len]] = val
+
+        self.buffers[self.TERMINATE_KEY][idx] = path.terminate.value
+        self.buffers[self.PATH_START_KEY][idx] = idx[0]
+        self.buffers[self.PATH_END_KEY][idx] = idx[-1]
+        return
+
+
+class SampleBuffer(object):
+    def __init__(self, size):
+        self.idx_to_slot = np.empty(shape=[size], dtype=int)
+        self.slot_to_idx = np.empty(shape=[size], dtype=int)
+        self.count = 0
+        self.clear()
+        return
+    
+    def clear(self):
+        self.idx_to_slot.fill(-1)
+        self.slot_to_idx.fill(-1)
+        self.count = 0
+        return
+
+    def is_valid(self, idx):
+        return self.idx_to_slot[idx] != -1
+
+    def get_size(self):
+        return self.idx_to_slot.shape[0]
+
+    def add(self, idx):
+        for i in idx:
+            if not self.is_valid(i):
+                new_slot = self.count
+                assert new_slot >= 0
+
+                self.idx_to_slot[i] = new_slot
+                self.slot_to_idx[new_slot] = i
+                self.count += 1
+        return
+
+    def free(self, idx):
+        for i in idx:
+            if self.is_valid(i):
+                slot = self.idx_to_slot[i]
+                last_slot = self.count - 1
+                last_idx = self.slot_to_idx[last_slot]
+
+                self.idx_to_slot[last_idx] = slot
+                self.slot_to_idx[slot] = last_idx
+                self.idx_to_slot[i] = -1
+                self.slot_to_idx[last_slot] = -1
+                self.count -= 1
+        return
+
+    def sample(self, n):
+        if self.count > 0:
+            slots = np.random.randint(0, self.count, size=n)
+            idx = self.slot_to_idx[slots]
+        else:
+            idx = np.empty(shape=[0], dtype=int)
+        return idx
+
+    def check_consistency(self):
+        valid = True
+        if self.count < 0:
+            valid = False
+
+        if valid:
+            for i in range(self.get_size()):
+                if self.is_valid(i):
+                    s = self.idx_to_slot[i]
+                    if self.slot_to_idx[s] != i:
+                        valid = False
+                        break
+
+                s2i = self.slot_to_idx[i] 
+                if s2i != -1:
+                    i2s = self.idx_to_slot[s2i]
+                    if i2s != i:
+                        valid = False
+                        break
+
+        count0 = np.sum(self.idx_to_slot == -1)
+        count1 = np.sum(self.slot_to_idx == -1)
+        valid &= count0 == count1
+        return valid
+
+class Path(object):
+    def __init__(self):
+        self.clear()
+        return
+
+    def pathlength(self):
+        return len(self.actions)
+
+    def is_valid(self):
+        valid = True
+        l = self.pathlength()
+        valid &= len(self.states) == l + 1
+        valid &= len(self.goals) == l + 1
+        valid &= len(self.actions) == l
+        valid &= len(self.logps) == l
+        valid &= len(self.rewards) == l
+        valid &= len(self.flags) == l
+
+        return valid
+
+    def check_vals(self):
+        for vals in [self.states, self.goals, self.actions, self.logps,
+                  self.rewards]:
+            for v in vals:
+                if not np.isfinite(v).all():
+                    return False
+        return True
+
+    def clear(self):
+        self.states = []
+        self.goals = []
+        self.actions = []
+        self.logps = []
+        self.rewards = []
+        self.flags = []
+        self.terminate = Env.Terminate.Null
+        return
+
+    def get_pathlen(self):
+        return len(self.rewards)
+
+    def calc_return(self):
+        return sum(self.rewards)
+
+class ExpParams(object):
+    RATE_KEY = 'Rate'
+    NOISE_KEY = 'Noise'
+
+    def __init__(self):
+        self.rate = 0.2
+        self.noise = 0.1
+        return
+
+    def __str__(self):
+        str = ''
+        str += '{}: {:.2f}\n'.format(self.RATE_KEY, self.rate)
+        str += '{}: {:.2f}\n'.format(self.NOISE_KEY, self.noise)
+        return str
+
+    def load(self, json_data):
+        if (self.RATE_KEY in json_data):
+            self.rate = json_data[self.RATE_KEY]
+
+        if (self.NOISE_KEY in json_data):
+            self.noise = json_data[self.NOISE_KEY]
+
+        return
+
+    def lerp(self, other, t):
+        lerp_params = ExpParams()
+        lerp_params.rate = lerp(self.rate, other.rate, t)
+        lerp_params.noise = lerp(self.noise, other.noise, t)
+        return lerp_params
