@@ -103,6 +103,12 @@ class TFAgent(RLAgent):
                 self._a_norm = TFNormalizer(self.sess, 'a_norm', self.get_action_size())
                 self._a_norm.set_mean_std(-self.world.env.build_action_offset(self.id), 
                                          1 / self.world.env.build_action_scale(self.id))
+        print("normalize")
+        print(self.world.env.build_state_offset(self.id))
+        print(self.world.env.build_state_scale(self.id))
+        print(self.world.env.build_action_offset(self.id))
+        print(self.world.env.build_action_scale(self.id))
+        print("norm end")
         return
 
     def _load_normalizers(self):

@@ -228,6 +228,10 @@ class RLAgent(ABC):
     def _build_bounds(self):
         self._a_bound_min = self.world.env.build_action_bound_min(self.id)
         self._a_bound_max = self.world.env.build_action_bound_max(self.id)
+        print("a_bound")
+        print(self._a_bound_min)
+        print(self._a_bound_max)
+        print("a_bound_end")
         return
 
     def _load_params(self, json_data):

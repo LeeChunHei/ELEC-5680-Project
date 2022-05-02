@@ -2,20 +2,23 @@ import numpy as np
 import copy as copy
 import tensorflow as tf
 
-from learning.pg_agent import PGAgent
+# from learning.pg_agent import PGAgent
+from learning.tf_agent import TFAgent
 from learning.solvers.mpi_solver import MPISolver
 import learning.tf_util as TFUtil
 import learning.rl_util as RLUtil
+import learning.nets.fc_2layers_1024units as fc_2layers_1024units
 from util.logger import Logger
 import util.mpi_util as MPIUtil
 import util.math_util as MathUtil
+from env.action_space import ActionSpace
 from env.env import Env
 
 '''
 Proximal Policy Optimization Agent
 '''
 
-class PPOAgent(PGAgent):
+class PPOAgent(TFAgent):
     NAME = "PPO"
     EPOCHS_KEY = "Epochs"
     BATCH_SIZE_KEY = "BatchSize"
@@ -26,8 +29,36 @@ class PPOAgent(PGAgent):
     
     ADV_EPS = 1e-5
 
-    def __init__(self, world, id, json_data): 
+    ACTOR_NET_KEY = 'ActorNet'
+    ACTOR_STEPSIZE_KEY = 'ActorStepsize'
+    ACTOR_MOMENTUM_KEY = 'ActorMomentum'
+    ACTOR_WEIGHT_DECAY_KEY = 'ActorWeightDecay'
+    ACTOR_INIT_OUTPUT_SCALE_KEY = 'ActorInitOutputScale'
+
+    CRITIC_NET_KEY = 'CriticNet'
+    CRITIC_STEPSIZE_KEY = 'CriticStepsize'
+    CRITIC_MOMENTUM_KEY = 'CriticMomentum'
+    CRITIC_WEIGHT_DECAY_KEY = 'CriticWeightDecay'
+
+    MAIN_SCOPE = "main"
+    
+    EXP_ACTION_FLAG = 1 << 0
+
+    #TODO: parameter that need to tune
+    TAU = 0.01
+    GAMMA = 0.9
+    POLICY_NOISE = 0.2
+    NOISE_CLIP = 0.5
+    POLICY_FREQ = 3
+
+    def __init__(self, world, id, json_data):
+        self._exp_action = False
         super().__init__(world, id, json_data)
+        return
+
+    def reset(self):
+        super().reset()
+        self._exp_action = False
         return
 
     def _load_params(self, json_data):
@@ -65,78 +96,177 @@ class PPOAgent(PGAgent):
         self._s_ph = tf.placeholder(tf.float32, shape=[None, s_size], name="s")
         self._g_ph = tf.placeholder(tf.float32, shape=([None, g_size] if self.has_goal() else None), name="g")
         self._a_ph = tf.placeholder(tf.float32, shape=[None, a_size], name="a")
-        self._old_logp_ph = tf.placeholder(tf.float32, shape=[None], name="old_logp")
-        self._tar_val_ph = tf.placeholder(tf.float32, shape=[None], name="tar_val")
-        self._adv_ph = tf.placeholder(tf.float32, shape=[None], name="adv")
+        self._r_ph = tf.placeholder(tf.float32, shape=[None, 1], name="r")
+        self._n_s_ph = tf.placeholder(tf.float32, shape=[None, s_size], name="n_s")
+        self._n_g_ph = tf.placeholder(tf.float32, shape=([None, g_size] if self.has_goal() else None), name="n_g")
+        # self._old_logp_ph = tf.placeholder(tf.float32, shape=[None], name="old_logp")
+        # self._tar_val_ph = tf.placeholder(tf.float32, shape=[None], name="tar_val")
+        # self._adv_ph = tf.placeholder(tf.float32, shape=[None], name="adv")
 
-        with tf.variable_scope('main'):
-            self._norm_a_pd_tf = self._build_net_actor(actor_net_name, self._get_actor_inputs(), actor_init_output_scale)
-            self._critic_tf = self._build_net_critic(critic_net_name, self._get_critic_inputs())
+        with tf.variable_scope(self.MAIN_SCOPE):
+            self._norm_actor_tf = self._build_net_actor(actor_net_name, "actor", self._get_actor_inputs(), actor_init_output_scale, True)
+            _norm_actor_target_tf = self._build_net_actor(actor_net_name, "actor_target", self._get_actor_target_inputs(), actor_init_output_scale, False)
+            sample = tf.distributions.Normal(loc=0.0, scale=1.0)
+            noise = tf.clip_by_value(sample.sample(1)*self.POLICY_NOISE, -self.NOISE_CLIP, self.NOISE_CLIP)
+            self._norm_actor_target_noised_tf = _norm_actor_target_tf + noise
+            self.current_q1 = self._build_net_critic(critic_net_name, "critic_q1", self._get_current_critic_inputs(), True)
+            self._critic_q1_tf = self._build_net_critic(critic_net_name, "critic_q1", self._get_critic_inputs(), True, reuse = True)
+            self.current_q2 = self._build_net_critic(critic_net_name, "critic_q2", self._get_current_critic_inputs(), True)
+            self._critic_q2_tf = self._build_net_critic(critic_net_name, "critic_q2", self._get_critic_inputs(), True, reuse = True)
+            self._critic_q1_target_tf = self._build_net_critic(critic_net_name, "critic_q1_target", self._get_critic_target_inputs(), False)
+            self._critic_q2_target_tf = self._build_net_critic(critic_net_name, "critic_q2_target", self._get_critic_target_inputs(), False)
                 
-        if (self._norm_a_pd_tf != None):
+        if (self._norm_actor_tf != None):
             Logger.print("Built actor net: " + actor_net_name)
 
-        if (self._critic_tf != None):
+        if (self._critic_q1_tf != None):
             Logger.print("Built critic net: " + critic_net_name)
         
-        sample_norm_a_tf = self._norm_a_pd_tf.sample()
-        self._sample_a_tf = self._a_norm.unnormalize_tf(sample_norm_a_tf)
-        self._sample_a_logp_tf = self._norm_a_pd_tf.logp(sample_norm_a_tf)
-        
-        mode_norm_a_tf = self._norm_a_pd_tf.get_mode()
-        self._mode_a_tf = self._a_norm.unnormalize_tf(mode_norm_a_tf)
-        self._mode_a_logp_tf = self._norm_a_pd_tf.logp(mode_norm_a_tf)
-        
-        norm_tar_a_tf = self._a_norm.normalize_tf(self._a_ph)
-        self._a_logp_tf = self._norm_a_pd_tf.logp(norm_tar_a_tf)
+        self.actor_param = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.MAIN_SCOPE+"/actor")
+        self.actor_target_param = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.MAIN_SCOPE+"/actor_target")
+        self.critic_q1_param = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.MAIN_SCOPE+"/critic_q1")
+        self.critic_q2_param = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.MAIN_SCOPE+"/critic_q2")
+        self.critic_q1_target_param = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.MAIN_SCOPE+"/critic_q1_target")
+        self.critic_q2_target_param = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.MAIN_SCOPE+"/critic_q2_target")
+
+        self.soft_replace = [tf.assign(t, (1-self.TAU)*t + self.TAU*e)
+                                for t,e in zip(self.actor_target_param+self.critic_q1_target_param+self.critic_q2_target_param, 
+                                                self.actor_param+self.critic_q1_param+self.critic_q2_param)]
+        self.hard_replace = [tf.assign(t, e)
+                                for t,e in zip(self.actor_target_param+self.critic_q1_target_param+self.critic_q2_target_param, 
+                                                self.actor_param+self.critic_q1_param+self.critic_q2_param)]
+
+        self.sess.run(self.hard_replace)
         
         return
 
     def _build_losses(self, json_data):
-        actor_bound_loss_weight = 10.0
-        actor_weight_decay = 0 if (self.ACTOR_WEIGHT_DECAY_KEY not in json_data) else json_data[self.ACTOR_WEIGHT_DECAY_KEY]
-        critic_weight_decay = 0 if (self.CRITIC_WEIGHT_DECAY_KEY not in json_data) else json_data[self.CRITIC_WEIGHT_DECAY_KEY]
-        
-        val_diff = self._tar_val_ph - self._critic_tf
-        self._critic_loss_tf = 0.5 * tf.reduce_mean(tf.square(val_diff))
+        q_target = self._r_ph + self.GAMMA * tf.minimum(self._critic_q1_target_tf, self._critic_q2_target_tf)
 
-        if (critic_weight_decay != 0):
-            self._critic_loss_tf += critic_weight_decay * self._weight_decay_loss(self.MAIN_SCOPE + '/critic')
-        
-        ratio_tf = tf.exp(self._a_logp_tf - self._old_logp_ph)
-        actor_loss0 = self._adv_ph * ratio_tf
-        actor_loss1 = self._adv_ph * tf.clip_by_value(ratio_tf, 1.0 - self.ratio_clip, 1 + self.ratio_clip)
-        actor_loss_tf = tf.minimum(actor_loss0, actor_loss1)
-        self._actor_loss_tf = -tf.reduce_mean(actor_loss_tf)
-        
-        # for debugging
-        self._clip_frac_tf = tf.reduce_mean(tf.to_float(tf.greater(tf.abs(ratio_tf - 1.0), self.ratio_clip)))
+        self.td_error1 = tf.losses.mean_squared_error(labels=q_target, predictions=self.current_q1)
+        self.td_error2 = tf.losses.mean_squared_error(labels=q_target, predictions=self.current_q2)
 
-        if (actor_bound_loss_weight != 0.0):
-            self._actor_loss_tf += actor_bound_loss_weight * self._build_action_bound_loss(self._norm_a_pd_tf)
-
-        if (actor_weight_decay != 0):
-            self._actor_loss_tf += actor_weight_decay * self._weight_decay_loss(self.MAIN_SCOPE + '/actor')
+        self.a_loss = -tf.reduce_mean(self._critic_q1_tf)
          
         return
 
     def _build_solvers(self, json_data):
+        # print("build_solvers")
         actor_stepsize = 0.001 if (self.ACTOR_STEPSIZE_KEY not in json_data) else json_data[self.ACTOR_STEPSIZE_KEY]
         actor_momentum = 0.9 if (self.ACTOR_MOMENTUM_KEY not in json_data) else json_data[self.ACTOR_MOMENTUM_KEY]
         critic_stepsize = 0.01 if (self.CRITIC_STEPSIZE_KEY not in json_data) else json_data[self.CRITIC_STEPSIZE_KEY]
         critic_momentum = 0.9 if (self.CRITIC_MOMENTUM_KEY not in json_data) else json_data[self.CRITIC_MOMENTUM_KEY]
         
-        critic_vars = self._tf_vars(self.MAIN_SCOPE + '/critic')
-        critic_opt = tf.train.MomentumOptimizer(learning_rate=critic_stepsize, momentum=critic_momentum)
-        self._critic_grad_tf = tf.gradients(self._critic_loss_tf, critic_vars)
-        self._critic_solver = MPISolver(self.sess, critic_opt, critic_vars)
+        critic_q1_vars = self._tf_vars(self.MAIN_SCOPE + '/critic_q1')
+        critic_q1_opt = tf.train.AdamOptimizer(learning_rate=critic_stepsize)
+        self._critic_q1_grad_tf = tf.gradients(self.td_error1, critic_q1_vars)
+        self._critic_q1_solver = MPISolver(self.sess, critic_q1_opt, critic_q1_vars)
+
+        critic_q2_vars = self._tf_vars(self.MAIN_SCOPE + '/critic_q2')
+        critic_q2_opt = tf.train.AdamOptimizer(learning_rate=critic_stepsize)
+        self._critic_q2_grad_tf = tf.gradients(self.td_error2, critic_q2_vars)
+        self._critic_q2_solver = MPISolver(self.sess, critic_q2_opt, critic_q2_vars)
+        # print(self._critic_q1_grad_tf)
 
         actor_vars = self._tf_vars(self.MAIN_SCOPE + '/actor')
-        actor_opt = tf.train.MomentumOptimizer(learning_rate=actor_stepsize, momentum=actor_momentum)
-        self._actor_grad_tf = tf.gradients(self._actor_loss_tf, actor_vars)
+        actor_opt = tf.train.AdamOptimizer(learning_rate=actor_stepsize)
+        self._actor_grad_tf = tf.gradients(self.a_loss, actor_vars)
+        # print(self._actor_grad_tf, actor_vars)
         self._actor_solver = MPISolver(self.sess, actor_opt, actor_vars)
         
         return
+
+    def _build_net_actor(self, net_name, scope, input_tfs, init_output_scale, trainable, reuse=False):
+        a_size = self.get_action_size()
+        with tf.variable_scope(scope, reuse=reuse):
+            if (net_name == fc_2layers_1024units.NAME):
+                layers = [1024, 512]
+                activation = tf.nn.relu
+
+                input_tf = tf.concat(axis=-1, values=input_tfs)
+                curr_tf = input_tf
+                for i, size in enumerate(layers):
+                    with tf.variable_scope(str(i), reuse=reuse):
+                        curr_tf = tf.layers.dense(inputs=curr_tf,
+                                                  units=size,
+                                                  kernel_initializer=tf.contrib.layers.xavier_initializer(),
+                                                  activation = activation,
+                                                  trainable=trainable)
+                with tf.variable_scope("output_layer", reuse=reuse):
+                    a = tf.layers.dense(curr_tf, a_size, activation=tf.nn.tanh, trainable=trainable)
+                norm_actor_tf = a
+                # print(self._a_bound_max, self._a_bound_min)
+                # bound_range = (self._a_bound_max - self._a_bound_min) / 2
+                # bound_offset = (self._a_bound_max + self._a_bound_min) / 2
+                # norm_actor_tf = tf.multiply(a, bound_range, "bound_scale")
+                # norm_actor_tf = tf.add_n([norm_actor_tf, bound_offset], "bound_offset")
+            else:
+                assert False, 'Unsupported net: ' + net_name
+        return norm_actor_tf
+    
+    def _build_net_critic(self, net_name, scope, input_tfs, trainable, reuse=False):
+        with tf.variable_scope(scope, reuse=reuse):
+            if (net_name == fc_2layers_1024units.NAME):
+                layers = [1024, 512]
+                activation = tf.nn.relu
+
+                input_tf = tf.concat(axis=-1, values=input_tfs)
+                curr_tf = input_tf
+                for i, size in enumerate(layers):
+                    with tf.variable_scope(str(i), reuse=reuse):
+                        curr_tf = tf.layers.dense(inputs=curr_tf,
+                                                  units=size,
+                                                  kernel_initializer=tf.contrib.layers.xavier_initializer(),
+                                                  activation = activation,
+                                                  trainable=trainable)
+                with tf.variable_scope("output_layer", reuse=reuse):
+                    c = tf.layers.dense(curr_tf, 1, kernel_initializer=tf.contrib.layers.xavier_initializer(), trainable=trainable)
+            else:
+                assert False, 'Unsupported net: ' + net_name
+        return c
+
+    def _get_actor_inputs(self):
+        norm_s_tf = self._s_norm.normalize_tf(self._s_ph)
+        input_tfs = [norm_s_tf]
+        if (self.has_goal()):
+            norm_g_tf = self._g_norm.normalize_tf(self._g_ph)
+            input_tfs += [norm_g_tf]
+        return input_tfs
+    
+    def _get_actor_target_inputs(self):
+        norm_s_tf = self._s_norm.normalize_tf(self._n_s_ph)
+        input_tfs = [norm_s_tf]
+        if (self.has_goal()):
+            norm_g_tf = self._g_norm.normalize_tf(self._n_g_ph)
+            input_tfs += [norm_g_tf]
+        return input_tfs
+    
+    def _get_current_critic_inputs(self):
+        norm_s_tf = self._s_norm.normalize_tf(self._s_ph)
+        input_tfs = [norm_s_tf]
+        if (self.has_goal()):
+            norm_g_tf = self._g_norm.normalize_tf(self._g_ph)
+            input_tfs += [norm_g_tf]
+        input_tfs += [self._a_ph]
+        return input_tfs
+
+    def _get_critic_inputs(self):
+        norm_s_tf = self._s_norm.normalize_tf(self._s_ph)
+        input_tfs = [norm_s_tf]
+        if (self.has_goal()):
+            norm_g_tf = self._g_norm.normalize_tf(self._g_ph)
+            input_tfs += [norm_g_tf]
+        input_tfs += [self._norm_actor_tf]
+        return input_tfs
+
+    def _get_critic_target_inputs(self):
+        norm_s_tf = self._s_norm.normalize_tf(self._n_s_ph)
+        input_tfs = [norm_s_tf]
+        if (self.has_goal()):
+            norm_g_tf = self._g_norm.normalize_tf(self._n_g_ph)
+            input_tfs += [norm_g_tf]
+        input_tfs += [self._norm_actor_target_noised_tf]
+        return input_tfs
 
     def _train_step(self):
         start_idx = self.replay_buffer.buffer_tail
@@ -150,86 +280,83 @@ class PPOAgent(PGAgent):
         end_mask = np.logical_not(end_mask) 
         
         rewards = self._fetch_batch_rewards(start_idx, end_idx)
-        vals = self._compute_batch_vals(start_idx, end_idx)
-        new_vals = self._compute_batch_new_vals(start_idx, end_idx, rewards, vals)
 
         valid_idx = idx[end_mask]
-        exp_idx = self.replay_buffer.get_idx_filtered(self.EXP_ACTION_FLAG).copy()
         num_valid_idx = valid_idx.shape[0]
-        num_exp_idx = exp_idx.shape[0]
-        exp_idx = np.column_stack([exp_idx, np.array(list(range(0, num_exp_idx)), dtype=np.int32)])
         
         local_sample_count = valid_idx.size
         global_sample_count = int(MPIUtil.reduce_sum(local_sample_count))
         mini_batches = int(np.ceil(global_sample_count / self.mini_batch_size))
-        
-        adv = new_vals[exp_idx[:,0]] - vals[exp_idx[:,0]]
-        new_vals = np.clip(new_vals, self.val_min, self.val_max)
-
-        adv_mean = np.mean(adv)
-        adv_std = np.std(adv)
-        adv = (adv - adv_mean) / (adv_std + self.ADV_EPS)
-        adv = np.clip(adv, -self.norm_adv_clip, self.norm_adv_clip)
 
         critic_loss = 0
         actor_loss = 0
-        actor_clip_frac = 0
 
         for e in range(self.epochs):
             np.random.shuffle(valid_idx)
-            np.random.shuffle(exp_idx)
 
             for b in range(mini_batches):
                 batch_idx_beg = b * self._local_mini_batch_size
                 batch_idx_end = batch_idx_beg + self._local_mini_batch_size
 
                 critic_batch = np.array(range(batch_idx_beg, batch_idx_end), dtype=np.int32)
-                actor_batch = critic_batch.copy()
                 critic_batch = np.mod(critic_batch, num_valid_idx)
-                actor_batch = np.mod(actor_batch, num_exp_idx)
-                shuffle_actor = (actor_batch[-1] < actor_batch[0]) or (actor_batch[-1] == num_exp_idx - 1)
 
                 critic_batch = valid_idx[critic_batch]
-                actor_batch = exp_idx[actor_batch]
-                critic_batch_vals = new_vals[critic_batch]
-                actor_batch_adv = adv[actor_batch[:,1]]
+
+                critic_next_batch = critic_batch + 1
+                mask = np.in1d(critic_next_batch, valid_idx)
+                critic_batch = critic_batch[mask]
+                critic_next_batch = critic_next_batch[mask]
 
                 critic_s = self.replay_buffer.get('states', critic_batch)
                 critic_g = self.replay_buffer.get('goals', critic_batch) if self.has_goal() else None
-                curr_critic_loss = self._update_critic(critic_s, critic_g, critic_batch_vals)
+                critic_a = self.replay_buffer.get('actions', critic_batch)
+                critic_next_s = self.replay_buffer.get('states', critic_next_batch)
+                critic_next_g = self.replay_buffer.get('goals', critic_next_batch) if self.has_goal() else None
+                critic_reward = rewards[critic_batch]
 
-                actor_s = self.replay_buffer.get("states", actor_batch[:,0])
-                actor_g = self.replay_buffer.get("goals", actor_batch[:,0]) if self.has_goal() else None
-                actor_a = self.replay_buffer.get("actions", actor_batch[:,0])
-                actor_logp = self.replay_buffer.get("logps", actor_batch[:,0])
-                curr_actor_loss, curr_actor_clip_frac = self._update_actor(actor_s, actor_g, actor_a, actor_logp, actor_batch_adv)
-                
+                feed = {
+                    self._s_ph: critic_s,
+                    self._g_ph: critic_g,
+                    self._a_ph: critic_a,
+                    self._r_ph: critic_reward.reshape((-1,1)),
+                    self._n_s_ph: critic_next_s,
+                    self._n_g_ph: critic_next_g
+                }
+                # print(critic_s.shape, critic_a.shape, critic_reward.shape, critic_next_s.shape)
+                critic_q1_loss, critic_q1_grad, critic_q2_loss, critic_q2_grad = self.sess.run([self.td_error1, self._critic_q1_grad_tf,
+                                                                                                self.td_error2, self._critic_q2_grad_tf],
+                                                                                                feed_dict=feed)
+                self._critic_q1_solver.update(critic_q1_grad)
+                self._critic_q2_solver.update(critic_q2_grad)
+                curr_critic_loss = critic_q1_loss+critic_q2_loss
                 critic_loss += curr_critic_loss
-                actor_loss += np.abs(curr_actor_loss)
-                actor_clip_frac += curr_actor_clip_frac
 
-                if (shuffle_actor):
-                    np.random.shuffle(exp_idx)
+                if self.iter % self.POLICY_FREQ == 0:
+                    # print(self.a_loss)
+                    # print(self._actor_grad_tf)
+                    # print(self._critic_q1_tf)
+                    curr_actor_loss, actor_grad = self.sess.run([self.a_loss, self._actor_grad_tf], feed_dict=feed)
+                    self._actor_solver.update(actor_grad)
+                    actor_loss += np.abs(curr_actor_loss)
+                    self.sess.run(self.soft_replace)
 
         total_batches = mini_batches * self.epochs
         critic_loss /= total_batches
         actor_loss /= total_batches
-        actor_clip_frac /= total_batches
 
         critic_loss = MPIUtil.reduce_avg(critic_loss)
         actor_loss = MPIUtil.reduce_avg(actor_loss)
-        actor_clip_frac = MPIUtil.reduce_avg(actor_clip_frac)
 
-        critic_stepsize = self._critic_solver.get_stepsize()
-        actor_stepsize = self._actor_solver.get_stepsize()
+        critic_q1_stepsize, critic_q2_stepsize, actor_stepsize = self.sess.run([self._critic_q1_solver.optimizer._lr_t,
+                                                                                self._critic_q2_solver.optimizer._lr_t,
+                                                                                self._actor_solver.optimizer._lr_t])
 
         self.logger.log_tabular('Critic_Loss', critic_loss)
-        self.logger.log_tabular('Critic_Stepsize', critic_stepsize)
+        self.logger.log_tabular('Critic_Q1_Stepsize', critic_q1_stepsize)
+        self.logger.log_tabular('Critic_Q2_Stepsize', critic_q2_stepsize)
         self.logger.log_tabular('Actor_Loss', actor_loss) 
         self.logger.log_tabular('Actor_Stepsize', actor_stepsize)
-        self.logger.log_tabular('Clip_Frac', actor_clip_frac)
-        self.logger.log_tabular('Adv_Mean', adv_mean)
-        self.logger.log_tabular('Adv_Std', adv_std)
 
     def _train(self):
         super()._train()
@@ -237,6 +364,7 @@ class PPOAgent(PGAgent):
         return
     
     def _fetch_batch_rewards(self, start_idx, end_idx):
+        print("should not call this reward")
         rewards = self.replay_buffer.get_all("rewards")[start_idx:end_idx]
         return rewards
 
@@ -248,63 +376,86 @@ class PPOAgent(PGAgent):
         exp_samples = self.replay_buffer.count_filtered(self.EXP_ACTION_FLAG)
         return (samples >= self._local_batch_size) and (exp_samples >= self._local_mini_batch_size)
 
-    def _compute_batch_vals(self, start_idx, end_idx):
-        states = self.replay_buffer.get_all("states")[start_idx:end_idx]
-        goals = self.replay_buffer.get_all("goals")[start_idx:end_idx] if self.has_goal() else None
-        
-        idx = np.array(list(range(start_idx, end_idx)))        
-        is_end = self.replay_buffer.is_path_end(idx)
-        is_fail = self.replay_buffer.check_terminal_flag(idx, Env.Terminate.Fail)
-        is_succ = self.replay_buffer.check_terminal_flag(idx, Env.Terminate.Succ)
-        is_fail = np.logical_and(is_end, is_fail) 
-        is_succ = np.logical_and(is_end, is_succ) 
+    def _check_action_space(self):
+        action_space = self.get_action_space()
+        return action_space == ActionSpace.Continuous
 
-        vals = self._eval_critic(states, goals)
-        vals[is_fail] = self.val_fail
-        vals[is_succ] = self.val_succ
+    # def _update_critic(self, s, g, tar_vals):
+    #     feed = {
+    #         self._s_ph: s,
+    #         self._g_ph: g,
+    #         self._tar_val_ph: tar_vals
+    #     }
 
-        return vals
-
-    def _compute_batch_new_vals(self, start_idx, end_idx, rewards, val_buffer):
-        if self.discount == 0:
-            new_vals = rewards.copy()
-        else:
-            new_vals = np.zeros_like(val_buffer)
-
-            curr_idx = start_idx
-            while curr_idx < end_idx:
-                idx0 = curr_idx - start_idx
-                idx1 = self.replay_buffer.get_path_end(curr_idx) - start_idx
-                r = rewards[idx0:idx1]
-                v = val_buffer[idx0:(idx1 + 1)]
-
-                new_vals[idx0:idx1] = RLUtil.compute_return(r, self.discount, self.td_lambda, v)
-                curr_idx = idx1 + start_idx + 1
-        
-        return new_vals
-
-    def _update_critic(self, s, g, tar_vals):
-        feed = {
-            self._s_ph: s,
-            self._g_ph: g,
-            self._tar_val_ph: tar_vals
-        }
-
-        loss, grads = self.sess.run([self._critic_loss_tf, self._critic_grad_tf], feed)
-        self._critic_solver.update(grads)
-        return loss
+    #     loss, grads = self.sess.run([self._critic_loss_tf, self._critic_grad_tf], feed)
+    #     self._critic_solver.update(grads)
+    #     return loss
     
-    def _update_actor(self, s, g, a, logp, adv):
+    # def _update_actor(self, s, g, a, logp, adv):
+    #     feed = {
+    #         self._s_ph: s,
+    #         self._g_ph: g,
+    #         self._a_ph: a,
+    #         self._adv_ph: adv,
+    #         self._old_logp_ph: logp
+    #     }
+
+    #     loss, grads, clip_frac = self.sess.run([self._actor_loss_tf, self._actor_grad_tf,
+    #                                             self._clip_frac_tf], feed)
+    #     self._actor_solver.update(grads)
+
+    #     return loss, clip_frac
+
+    def _decide_action(self, s, g):
+        # print("decide_action")
+        with self.sess.as_default(), self.graph.as_default():
+            self._exp_action = True #TODO: don't know meaning of exp_action
+            a, logp = self._eval_actor(s, g)
+            # print(a)
+            a = a[0]
+            logp = logp[0]
+
+            # print(self._a_bound_max, self._a_bound_min)
+            bound_range = (self._a_bound_max - self._a_bound_min) / 2
+            bound_offset = (self._a_bound_max + self._a_bound_min) / 2
+            a = np.multiply(a, bound_range)
+            a = np.add(a, bound_offset)
+        #     print(a)
+        # print("end")
+
+        return a, logp
+
+    def _eval_actor(self, s, g):
+        s = np.reshape(s, [-1, self.get_state_size()])
+        g = np.reshape(g, [-1, self.get_goal_size()]) if self.has_goal() else None
+        
         feed = {
-            self._s_ph: s,
-            self._g_ph: g,
-            self._a_ph: a,
-            self._adv_ph: adv,
-            self._old_logp_ph: logp
+            self._s_ph : s,
+            self._g_ph : g
         }
+        a = self.sess.run(self._norm_actor_tf, feed_dict=feed)
+        logp = np.zeros_like(a)
 
-        loss, grads, clip_frac = self.sess.run([self._actor_loss_tf, self._actor_grad_tf,
-                                                self._clip_frac_tf], feed)
-        self._actor_solver.update(grads)
+        return a, logp
 
-        return loss, clip_frac
+    def _build_replay_buffer(self, buffer_size):
+        super()._build_replay_buffer(buffer_size)
+        self.replay_buffer.add_filter_key(self.EXP_ACTION_FLAG)
+        return
+
+    def _record_flags(self):
+        flags = int(0)
+        if (self._exp_action):
+            flags = flags | self.EXP_ACTION_FLAG
+        return flags
+
+    def _initialize_vars(self):
+        super()._initialize_vars()
+        self._sync_solvers()
+        return
+
+    def _sync_solvers(self):
+        self._actor_solver.sync()
+        self._critic_q1_solver.sync()
+        self._critic_q2_solver.sync()
+        return
