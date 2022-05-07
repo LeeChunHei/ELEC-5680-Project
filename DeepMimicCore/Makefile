@@ -5,7 +5,7 @@ MKDIR = mkdir -p
 EIGEN_DIR = ../../eigen
 BULLET_INC_DIR = ../../bullet3/src
 
-PYTHON_INC = ../../anaconda3/envs/deepmimic/include/python3.5m
+PYTHON_INC = ../../anaconda3/envs/deepmimic/include/python3.6m
 PYTHON_LIB = ../../anaconda3/envs/deepmimic/lib #/usr/lib/ -lpython3.6m
 
 INC = -I./ \

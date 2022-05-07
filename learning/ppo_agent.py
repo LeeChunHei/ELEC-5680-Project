@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import copy as copy
 import tensorflow as tf
@@ -45,11 +46,11 @@ class PPOAgent(TFAgent):
     EXP_ACTION_FLAG = 1 << 0
 
     #TODO: parameter that need to tune
-    TAU = 0.01
+    TAU = 0.005
     GAMMA = 0.9
     POLICY_NOISE = 0.2
     NOISE_CLIP = 0.5
-    POLICY_FREQ = 3
+    POLICY_FREQ = 2
 
     def __init__(self, world, id, json_data):
         self._exp_action = False
@@ -60,6 +61,19 @@ class PPOAgent(TFAgent):
         super().reset()
         self._exp_action = False
         return
+
+    def _store_path(self, path):
+        path_id = super()._store_path(path)
+
+        valid_path = (path_id != MathUtil.INVALID_IDX)
+        if (valid_path):
+            for i in range(len(path.states)-2):
+                state = path.states[i]
+                next_state = path.states[i+1]
+                action = path.actions[i]
+                amp_obs = path.amp_obs_agent[i]
+                self.td3_replay_buffer.add(state, action, next_state, amp_obs)
+        return path_id
 
     def _load_params(self, json_data):
         super()._load_params(json_data)
@@ -77,6 +91,11 @@ class PPOAgent(TFAgent):
         assert(self.replay_buffer_size > min_replay_size)
 
         self.replay_buffer_size = np.maximum(min_replay_size, self.replay_buffer_size)
+
+        td3_buffer_size = 10000
+        td3_buffer_size = np.maximum(min_replay_size, td3_buffer_size)
+
+        self.td3_replay_buffer = TD3ReplayBuffer(self.get_state_size(), self.get_action_size(), self._get_amp_obs_size(), td3_buffer_size) #self.replay_buffer_size
 
         return
 
@@ -105,6 +124,7 @@ class PPOAgent(TFAgent):
 
         with tf.variable_scope(self.MAIN_SCOPE):
             self._norm_actor_tf = self._build_net_actor(actor_net_name, "actor", self._get_actor_inputs(), actor_init_output_scale, True)
+            self._actor_tf = self._a_norm.unnormalize_tf(self._norm_actor_tf)
             _norm_actor_target_tf = self._build_net_actor(actor_net_name, "actor_target", self._get_actor_target_inputs(), actor_init_output_scale, False)
             sample = tf.distributions.Normal(loc=0.0, scale=1.0)
             noise = tf.clip_by_value(sample.sample(1)*self.POLICY_NOISE, -self.NOISE_CLIP, self.NOISE_CLIP)
@@ -146,9 +166,21 @@ class PPOAgent(TFAgent):
         self.td_error1 = tf.losses.mean_squared_error(labels=q_target, predictions=self.current_q1)
         self.td_error2 = tf.losses.mean_squared_error(labels=q_target, predictions=self.current_q2)
 
-        self.a_loss = -tf.reduce_mean(self._critic_q1_tf)
-         
+        self._bound_loss = self._build_action_bound_loss(self._norm_actor_tf)
+        self.a_loss = -tf.reduce_mean(self._critic_q1_tf) + 10*self._bound_loss
+        
         return
+
+    def _build_action_bound_loss(self, _actor_tf):
+        norm_a_bound_min = self._a_norm.normalize_tf(self._a_bound_min)
+        norm_a_bound_max = self._a_norm.normalize_tf(self._a_bound_max)
+
+        min_violation = tf.minimum(tf.subtract(_actor_tf, norm_a_bound_min), 0)
+        max_violation = tf.maximum(tf.subtract(_actor_tf, norm_a_bound_max), 0)
+        loss = 0.5*(tf.reduce_mean(tf.reduce_sum(tf.square(min_violation), axis=-1)) + 
+                    tf.reduce_mean(tf.reduce_sum(tf.square(max_violation), axis=-1)))
+        
+        return loss
 
     def _build_solvers(self, json_data):
         # print("build_solvers")
@@ -193,7 +225,7 @@ class PPOAgent(TFAgent):
                                                   activation = activation,
                                                   trainable=trainable)
                 with tf.variable_scope("output_layer", reuse=reuse):
-                    a = tf.layers.dense(curr_tf, a_size, activation=tf.nn.tanh, trainable=trainable)
+                    a = tf.layers.dense(curr_tf, a_size, trainable=trainable, kernel_initializer=tf.random_uniform_initializer(minval=-init_output_scale, maxval=init_output_scale))   #, activation=tf.nn.tanh
                 norm_actor_tf = a
                 # print(self._a_bound_max, self._a_bound_min)
                 # bound_range = (self._a_bound_max - self._a_bound_min) / 2
@@ -247,7 +279,7 @@ class PPOAgent(TFAgent):
         if (self.has_goal()):
             norm_g_tf = self._g_norm.normalize_tf(self._g_ph)
             input_tfs += [norm_g_tf]
-        input_tfs += [self._a_ph]
+        input_tfs += [self._a_norm.normalize_tf(self._a_ph)]
         return input_tfs
 
     def _get_critic_inputs(self):
@@ -268,28 +300,63 @@ class PPOAgent(TFAgent):
         input_tfs += [self._norm_actor_target_noised_tf]
         return input_tfs
 
+    def _calc_reward(self, obs_agent):
+        disc_r, _ = self._calc_disc_reward(obs_agent)
+        
+        disc_r *= self._reward_scale
+        self._disc_reward_mean = np.mean(disc_r)
+        self._disc_reward_std = np.std(disc_r)
+        
+        if (self._enable_amp_task_reward()):
+            assert False, "should not enable amp task reward"
+        else:
+            r = disc_r
+        
+        curr_reward_min = np.amin(r)
+        curr_reward_max = np.amax(r)
+        self._reward_min = np.minimum(self._reward_min, curr_reward_min)
+        self._reward_max = np.maximum(self._reward_max, curr_reward_max)
+        reward_data = np.array([self._reward_min, -self._reward_max])
+        reward_data = MPIUtil.reduce_min(reward_data)
+
+        self._reward_min = reward_data[0]
+        self._reward_max = -reward_data[1]
+
+        return r
+
     def _train_step(self):
-        start_idx = self.replay_buffer.buffer_tail
-        end_idx = self.replay_buffer.buffer_head
-        assert(start_idx == 0)
-        assert(self.replay_buffer.get_current_size() <= self.replay_buffer.buffer_size) # must avoid overflow
-        assert(start_idx < end_idx)
+        # start_idx = self.replay_buffer.buffer_tail
+        # end_idx = self.replay_buffer.buffer_head
+        # assert(start_idx == 0)
+        # assert(self.replay_buffer.get_current_size() <= self.replay_buffer.buffer_size) # must avoid overflow
+        # assert(start_idx < end_idx)
 
-        idx = np.array(list(range(start_idx, end_idx)))        
-        end_mask = self.replay_buffer.is_path_end(idx)
-        end_mask = np.logical_not(end_mask) 
+        # idx = np.array(list(range(start_idx, end_idx)))        
+        # end_mask = self.replay_buffer.is_path_end(idx)
+        # end_mask = np.logical_not(end_mask) 
         
-        rewards = self._fetch_batch_rewards(start_idx, end_idx)
+        amp_obs = self.td3_replay_buffer.amp_obs[:self.td3_replay_buffer.size]
 
-        valid_idx = idx[end_mask]
-        num_valid_idx = valid_idx.shape[0]
+        rewards = self._calc_reward(amp_obs)
+
+        # valid_idx = idx[end_mask]
+        # num_valid_idx = valid_idx.shape[0]
         
-        local_sample_count = valid_idx.size
+        local_sample_count = self.td3_replay_buffer.size #valid_idx.size
         global_sample_count = int(MPIUtil.reduce_sum(local_sample_count))
         mini_batches = int(np.ceil(global_sample_count / self.mini_batch_size))
 
+        valid_idx = np.array(list(range(0,local_sample_count)))
+        num_valid_idx = len(valid_idx)
+
         critic_loss = 0
         actor_loss = 0
+        bound_loss = 0
+
+        # print("shape")
+        # print(start_idx, end_idx)
+        # print(self.replay_buffer.buffers['states'].shape)
+        # print(rewards.shape)
 
         for e in range(self.epochs):
             np.random.shuffle(valid_idx)
@@ -303,25 +370,28 @@ class PPOAgent(TFAgent):
 
                 critic_batch = valid_idx[critic_batch]
 
-                critic_next_batch = critic_batch + 1
-                mask = np.in1d(critic_next_batch, valid_idx)
-                critic_batch = critic_batch[mask]
-                critic_next_batch = critic_next_batch[mask]
+                # critic_next_batch = critic_batch + 1
+                # mask = np.in1d(critic_next_batch, valid_idx)
+                # critic_batch = critic_batch[mask]
+                # critic_next_batch = critic_next_batch[mask]
 
-                critic_s = self.replay_buffer.get('states', critic_batch)
-                critic_g = self.replay_buffer.get('goals', critic_batch) if self.has_goal() else None
-                critic_a = self.replay_buffer.get('actions', critic_batch)
-                critic_next_s = self.replay_buffer.get('states', critic_next_batch)
-                critic_next_g = self.replay_buffer.get('goals', critic_next_batch) if self.has_goal() else None
+                # critic_s = self.replay_buffer.get('states', critic_batch)
+                # critic_g = self.replay_buffer.get('goals', critic_batch) if self.has_goal() else None
+                # critic_a = self.replay_buffer.get('actions', critic_batch)
+                # critic_next_s = self.replay_buffer.get('states', critic_next_batch)
+                # critic_next_g = self.replay_buffer.get('goals', critic_next_batch) if self.has_goal() else None
+                # critic_reward = rewards[critic_batch]
+
+                critic_s, critic_a, critic_next_s, _ = self.td3_replay_buffer.sample(critic_batch)
                 critic_reward = rewards[critic_batch]
 
                 feed = {
                     self._s_ph: critic_s,
-                    self._g_ph: critic_g,
+                    self._g_ph: None,#critic_g,
                     self._a_ph: critic_a,
                     self._r_ph: critic_reward.reshape((-1,1)),
                     self._n_s_ph: critic_next_s,
-                    self._n_g_ph: critic_next_g
+                    self._n_g_ph: None,#critic_next_g
                 }
                 # print(critic_s.shape, critic_a.shape, critic_reward.shape, critic_next_s.shape)
                 critic_q1_loss, critic_q1_grad, critic_q2_loss, critic_q2_grad = self.sess.run([self.td_error1, self._critic_q1_grad_tf,
@@ -336,17 +406,21 @@ class PPOAgent(TFAgent):
                     # print(self.a_loss)
                     # print(self._actor_grad_tf)
                     # print(self._critic_q1_tf)
-                    curr_actor_loss, actor_grad = self.sess.run([self.a_loss, self._actor_grad_tf], feed_dict=feed)
+                    # curr_actor_loss, actor_grad = self.sess.run([self.a_loss, self._actor_grad_tf], feed_dict=feed)
+                    curr_actor_loss, actor_grad, bound_loss = self.sess.run([self.a_loss, self._actor_grad_tf, self._bound_loss], feed_dict=feed)
                     self._actor_solver.update(actor_grad)
                     actor_loss += np.abs(curr_actor_loss)
+                    bound_loss += bound_loss
                     self.sess.run(self.soft_replace)
 
         total_batches = mini_batches * self.epochs
         critic_loss /= total_batches
         actor_loss /= total_batches
+        bound_loss /= total_batches
 
         critic_loss = MPIUtil.reduce_avg(critic_loss)
         actor_loss = MPIUtil.reduce_avg(actor_loss)
+        bound_loss = MPIUtil.reduce_avg(bound_loss)
 
         critic_q1_stepsize, critic_q2_stepsize, actor_stepsize = self.sess.run([self._critic_q1_solver.optimizer._lr_t,
                                                                                 self._critic_q2_solver.optimizer._lr_t,
@@ -356,6 +430,7 @@ class PPOAgent(TFAgent):
         self.logger.log_tabular('Critic_Q1_Stepsize', critic_q1_stepsize)
         self.logger.log_tabular('Critic_Q2_Stepsize', critic_q2_stepsize)
         self.logger.log_tabular('Actor_Loss', actor_loss) 
+        self.logger.log_tabular('Bound_Loss', bound_loss) 
         self.logger.log_tabular('Actor_Stepsize', actor_stepsize)
 
     def _train(self):
@@ -409,17 +484,18 @@ class PPOAgent(TFAgent):
     def _decide_action(self, s, g):
         # print("decide_action")
         with self.sess.as_default(), self.graph.as_default():
-            self._exp_action = True #TODO: don't know meaning of exp_action
+            self._exp_action = MathUtil.flip_coin(self.exp_params_curr.rate) #TODO: don't know meaning of exp_action
             a, logp = self._eval_actor(s, g)
             # print(a)
             a = a[0]
             logp = logp[0]
 
-            # print(self._a_bound_max, self._a_bound_min)
-            bound_range = (self._a_bound_max - self._a_bound_min) / 2
-            bound_offset = (self._a_bound_max + self._a_bound_min) / 2
-            a = np.multiply(a, bound_range)
-            a = np.add(a, bound_offset)
+            a = np.clip(a, self._a_bound_min, self._a_bound_max)
+            # # print(self._a_bound_max, self._a_bound_min)
+            # bound_range = (self._a_bound_max - self._a_bound_min) / 2
+            # bound_offset = (self._a_bound_max + self._a_bound_min) / 2
+            # a = np.multiply(a, bound_range)
+            # a = np.add(a, bound_offset)
         #     print(a)
         # print("end")
 
@@ -433,7 +509,7 @@ class PPOAgent(TFAgent):
             self._s_ph : s,
             self._g_ph : g
         }
-        a = self.sess.run(self._norm_actor_tf, feed_dict=feed)
+        a = self.sess.run(self._actor_tf, feed_dict=feed)
         logp = np.zeros_like(a)
 
         return a, logp
@@ -459,3 +535,34 @@ class PPOAgent(TFAgent):
         self._critic_q1_solver.sync()
         self._critic_q2_solver.sync()
         return
+
+class TD3ReplayBuffer():
+    def __init__(self, state_dim, action_dim, amp_obs_dim, max_size=int(1e6)):
+        self.max_size = max_size
+        self.ptr = 0
+        self.size = 0
+
+        self.state = np.zeros((max_size, state_dim))
+        self.action = np.zeros((max_size, action_dim))
+        self.next_state = np.zeros((max_size, state_dim))
+        self.amp_obs = np.zeros((max_size, amp_obs_dim))
+
+    def add(self, state, action, next_state, amp_obs):
+        self.state[self.ptr] = state
+        self.action[self.ptr] = action
+        self.next_state[self.ptr] = next_state
+        self.amp_obs[self.ptr] = amp_obs
+
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    def sample(self, batch):#_size):
+        ind = batch
+        # ind = np.random.randint(0, self.size, size=batch_size)
+
+        return (
+            self.state[ind],
+            self.action[ind],
+            self.next_state[ind],
+            self.amp_obs[ind],
+        )

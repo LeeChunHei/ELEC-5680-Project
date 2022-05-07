@@ -31,6 +31,8 @@ class TFAgent(RLAgent):
                 Logger.print('Model saved to: ' + save_path)
             except:
                 Logger.print("Failed to save model to: " + save_path)
+        # writer = tf.summary.FileWriter('./log', self.sess.graph)
+        # writer.close()
         return
 
     def load_model(self, in_path):
