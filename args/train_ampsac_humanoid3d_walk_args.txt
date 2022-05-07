@@ -28,6 +28,6 @@
 
 --agent_files data/agents/ct_agent_humanoid_amp_sac.txt
 
-#--model_files output_sac/agent0_model.ckpt
+--model_files output_sac/agent0_model.ckpt
 --output_path output_sac
 #--int_output_path output/intermediate

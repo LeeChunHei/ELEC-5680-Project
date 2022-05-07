@@ -133,8 +133,8 @@ class SACAgent(TFAgent):
         # self._adv_ph = tf.placeholder(tf.float32, shape=[None], name="adv")
 
         with tf.variable_scope(self.MAIN_SCOPE):
-            self._actor_action_tf, self._actor_log_prob_tf, self._actor_mean_tf = self._build_net_actor(actor_net_name, "actor", self._get_actor_inputs(), actor_init_output_scale, True)
-            self._actor_next_action_tf, self._actor_next_log_prob_tf, self._actor_next_mean_tf = self._build_net_actor(actor_net_name, "actor", self._get_next_actor_inputs(), actor_init_output_scale, True, reuse=True)
+            self._actor_action_tf, self._actor_log_prob_tf, self._actor_mean_tf, self._actor_action_untanh = self._build_net_actor(actor_net_name, "actor", self._get_actor_inputs(), actor_init_output_scale, True)
+            self._actor_next_action_tf, self._actor_next_log_prob_tf, self._actor_next_mean_tf, _ = self._build_net_actor(actor_net_name, "actor", self._get_next_actor_inputs(), actor_init_output_scale, True, reuse=True)
             
             self._critic_q1_tf = self._build_net_critic(critic_net_name, "critic_q1", self._get_critic_inputs(), True)
             self._critic_q2_tf = self._build_net_critic(critic_net_name, "critic_q2", self._get_critic_inputs(), True)
@@ -143,13 +143,13 @@ class SACAgent(TFAgent):
             self._critic_q1_target_tf = self._build_net_critic(critic_net_name, "critic_q1_target", self._get_critic_target_inputs(), False)
             self._critic_q2_target_tf = self._build_net_critic(critic_net_name, "critic_q2_target", self._get_critic_target_inputs(), False)
             
-            # self._target_entropy = -tf.reduce_prod(tf.constant((a_size,), dtype=tf.float32), name="target_entropy").eval()
+            self._target_entropy = -tf.reduce_prod(tf.constant((a_size,), dtype=tf.float32), name="target_entropy").eval()
             # print("target_entropy:",self._target_entropy)
-            # with tf.variable_scope("log_alpha", reuse=False):
-            #     self._log_alpha = tf.get_variable("log_alpha", initializer=np.zeros(1).astype(np.float32))
+            with tf.variable_scope("log_alpha", reuse=False):
+                self._log_alpha = tf.get_variable("log_alpha", initializer=np.zeros(1).astype(np.float32))
             # print(tf.trainable_variables())
             # print("next", self._log_alpha)
-            self.alpha = tf.constant(0.2, name="alpha")# tf.exp(self._log_alpha, name="alpha")
+            self.alpha = tf.exp(self._log_alpha, name="alpha")# tf.constant(0.2, name="alpha")
 
         if (self._actor_action_tf != None):
             Logger.print("Built actor net: " + actor_net_name)
@@ -184,15 +184,17 @@ class SACAgent(TFAgent):
 
         min_qf_pi = tf.minimum(self._critic_q1_pi_tf, self._critic_q2_pi_tf)
         self._policy_loss = tf.reduce_mean((self.alpha*self._actor_log_prob_tf) - min_qf_pi)
+        self._bound_loss = 10.0*self._build_action_bound_loss(self._actor_action_untanh)
+        self._policy_loss+= self._bound_loss
 
-        # _alpha_loss = -1.0 * (self.alpha * tf.stop_gradient(self._actor_log_prob_tf + self._target_entropy))
-        # self._alpha_loss = tf.reduce_mean(_alpha_loss)
+        _alpha_loss = -1.0 * (self.alpha * tf.stop_gradient(self._actor_log_prob_tf + self._target_entropy))
+        self._alpha_loss = tf.reduce_mean(_alpha_loss)
 
         return
 
     def _build_action_bound_loss(self, _actor_tf):
-        norm_a_bound_min = self._a_norm.normalize_tf(self._a_bound_min)
-        norm_a_bound_max = self._a_norm.normalize_tf(self._a_bound_max)
+        norm_a_bound_min = self._a_bound_min#self._a_norm.normalize_tf(self._a_bound_min)
+        norm_a_bound_max = self._a_bound_max#self._a_norm.normalize_tf(self._a_bound_max)
 
         min_violation = tf.minimum(tf.subtract(_actor_tf, norm_a_bound_min), 0)
         max_violation = tf.maximum(tf.subtract(_actor_tf, norm_a_bound_max), 0)
@@ -226,10 +228,10 @@ class SACAgent(TFAgent):
         # print(self._actor_grad_tf, actor_vars)
         self._actor_solver = MPISolver(self.sess, actor_opt, actor_vars)
         
-        # log_alpha_vars = self._tf_vars(self.MAIN_SCOPE + '/log_alpha')
-        # alpha_opt = tf.train.AdamOptimizer(learning_rate=alpha_stepsize)
-        # self._alpha_grad_tf = tf.gradients(self._alpha_loss, log_alpha_vars)
-        # self._alpha_solver = MPISolver(self.sess, alpha_opt, log_alpha_vars)
+        log_alpha_vars = self._tf_vars(self.MAIN_SCOPE + '/log_alpha')
+        alpha_opt = tf.train.AdamOptimizer(learning_rate=alpha_stepsize)
+        self._alpha_grad_tf = tf.gradients(self._alpha_loss, log_alpha_vars)
+        self._alpha_solver = MPISolver(self.sess, alpha_opt, log_alpha_vars)
 
         return
 
@@ -284,12 +286,13 @@ class SACAgent(TFAgent):
         #apply squashing
         logp_pi -= tf.reduce_sum(2*(np.log(2) - pi - tf.nn.softplus(-2*pi)), axis=1)
         mu = tf.tanh(mu)
+        untanh_pi = pi * bound_range + bound_offset
         pi = tf.tanh(pi)
         #scale
         mu = mu * bound_range + bound_offset
         pi = pi * bound_range + bound_offset
 
-        return pi, logp_pi, mu #action_tf, log_prob_tf, mean_tf
+        return pi, logp_pi, mu, untanh_pi #action_tf, log_prob_tf, mean_tf
     
     def _build_net_critic(self, net_name, scope, input_tfs, trainable, reuse=False):
         with tf.variable_scope(scope, reuse=reuse):
@@ -434,6 +437,7 @@ class SACAgent(TFAgent):
         critic_loss = 0
         actor_loss = 0
         alpha_loss = 0
+        bound_loss = 0
 
         # print("shape")
         # print(start_idx, end_idx)
@@ -485,23 +489,24 @@ class SACAgent(TFAgent):
                 curr_critic_loss = qf1_loss+qf2_loss
                 critic_loss += curr_critic_loss
 
-                policy_grad, policy_loss = self.sess.run([self._actor_grad_tf, self._policy_loss], feed_dict=feed)
+                policy_grad, policy_loss, bound_loss = self.sess.run([self._actor_grad_tf, self._policy_loss, self._bound_loss], feed_dict=feed)
                 self._actor_solver.update(policy_grad)
                 actor_loss += abs(policy_loss)
+                bound_loss += bound_loss
 
-                # alpha_grad, curr_alpha_loss = self.sess.run([self._alpha_grad_tf, self._alpha_loss], feed_dict=feed)
-                # if np.isnan(alpha_grad) or np.isnan(curr_alpha_loss):
-                #     print("grad or loss nan")
-                #     print(alpha_grad, curr_alpha_loss)
-                #     while True:
-                #         pass
-                # self._alpha_solver.update(alpha_grad)
-                # if np.isnan(self.alpha.eval()):
-                #     print("alpha nan")
-                #     print(alpha_grad, curr_alpha_loss)
-                #     while True:
-                #         pass
-                # alpha_loss += curr_alpha_loss
+                alpha_grad, curr_alpha_loss = self.sess.run([self._alpha_grad_tf, self._alpha_loss], feed_dict=feed)
+                if np.isnan(alpha_grad) or np.isnan(curr_alpha_loss):
+                    print("grad or loss nan")
+                    print(alpha_grad, curr_alpha_loss)
+                    while True:
+                        pass
+                self._alpha_solver.update(alpha_grad)
+                if np.isnan(self.alpha.eval()):
+                    print("alpha nan")
+                    print(alpha_grad, curr_alpha_loss)
+                    while True:
+                        pass
+                alpha_loss += curr_alpha_loss
 
         if self.iter % self.TARGET_UPDATE_INTERVAL == 0:
             self.sess.run(self.soft_replace)
@@ -510,10 +515,12 @@ class SACAgent(TFAgent):
         critic_loss /= total_batches
         actor_loss /= total_batches
         alpha_loss /= total_batches
+        bound_loss /= total_batches
 
         critic_loss = MPIUtil.reduce_avg(critic_loss)
         actor_loss = MPIUtil.reduce_avg(actor_loss)
         alpha_loss = MPIUtil.reduce_avg(alpha_loss)
+        bound_loss = MPIUtil.reduce_avg(bound_loss)
 
         critic_q1_stepsize, critic_q2_stepsize, actor_stepsize = self.sess.run([self._critic_q1_solver.optimizer._lr_t,
                                                                                 self._critic_q2_solver.optimizer._lr_t,
@@ -523,6 +530,7 @@ class SACAgent(TFAgent):
         self.logger.log_tabular('Critic_Q1_Stepsize', critic_q1_stepsize)
         self.logger.log_tabular('Critic_Q2_Stepsize', critic_q2_stepsize)
         self.logger.log_tabular('Actor_Loss', actor_loss) 
+        self.logger.log_tabular('Bound_Loss', bound_loss) 
         self.logger.log_tabular('Actor_Stepsize', actor_stepsize)
         self.logger.log_tabular('Alpha_Loss', alpha_loss)
         self.logger.log_tabular('Alpha', self.alpha.eval())
