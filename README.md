@@ -1,3 +1,56 @@
+# COMP5214 Project: Deep Imitation Learning for Bipedal Robot Manipulation
+Leslie Lee Chun Hei, Yueh Nicole Chee Lin
+
+## Overall Idea
+![LDPPO+AMP](https://user-images.githubusercontent.com/17170219/168863124-a3894357-69ee-46e6-8c88-f92f4a23f388.png)
+We would like to explore humanoid locomotion methods using deep imitation learning. With this goal, we tried to implement different DRL algos with GAIL. The framework we used is from Deep Mimic with AMP.
+
+The contribution of our project includes:
+
+1) Explore possiblility of implementing Deep Mimic AMP with deterministic and stochastic off-policy algorithms including TD3 and SAC. 
+2) Explored the existing network settings with different parameters for achieving an optimal performance
+3) Proposed an optimized PPO variant named Leaky Double Critic Proximal Policy Optimization (LDPPO) which can effectively reduce the number of parameters
+needed given the same performances while ensuring exploration ability comparing. 
+4) Generated a stable and human-like enough walking with the algorithms mentioned
+
+## Results
+As it requires a lot of time for training on our limited hardware, the training below is compared with trained agent achieving at most 550 test reward (~30M Parameters, 6000 iteration, where humanoid can walk for at least 2 steps). 
+The result of default settings under this limitation is:
+![default_vid](https://user-images.githubusercontent.com/17170219/168869160-002c9c92-a693-47d3-a625-4cf551c8db5d.png)
+
+
+### Parameters Exploring: 10X Learning Rate
+![network_lr](https://user-images.githubusercontent.com/17170219/168867812-a8dd3528-693b-4536-9881-a09d7eba74d8.png)
+![ezgif com-gif-maker](https://user-images.githubusercontent.com/17170219/168863104-625a12cf-126f-401a-9b46-2e30ed864276.gif)
+
+### Parameters Exploring: Change of Network Depth
+![network_depth](https://user-images.githubusercontent.com/17170219/168867247-7f9d5618-0073-4ac4-9124-7e1efd839fec.png)
+
+Result of 256 x 256 x256:
+![256_256_256_vid](https://user-images.githubusercontent.com/17170219/168869173-556acb96-fb6a-49c9-9832-c2180a5121aa.png)
+
+### Parameters Exploring: Change of Network Width
+![network_width](https://user-images.githubusercontent.com/17170219/168867853-065ceac0-3ac7-4826-b3dd-73585641dad8.png)
+
+Result of 512 x 512:
+![512_512_vid](https://user-images.githubusercontent.com/17170219/168868805-db1cbe66-fc49-457b-9f86-5709549438e8.png)
+
+
+### LDPPO vs PPO-Clip
+LDPPO has achieved the same or even better results than the others at ～9.5 parameters, 2300 iteration. 
+The results at iteration 2300 is shown below:
+
+![ldppo](https://user-images.githubusercontent.com/17170219/168867137-f238f07b-6f08-49de-a51c-a780efe314e8.png)
+![ezgif com-gif-maker(2)](https://user-images.githubusercontent.com/17170219/168871881-e356b75d-581d-4996-af33-9c9ba32d8040.gif)
+
+
+### Off-policy Algos: TD3 vs SAC vs PPO under Deep Mimic AMP framework
+![diff_policy](https://user-images.githubusercontent.com/17170219/168864396-62f8e9de-c8f8-4df9-b70c-f3c62d561a93.png)
+
+
+
+### Below is the instruction foor installation of Deep Mimic
+__________________________________________________________________________________________________
 # Intro 
 
 Code accompanying the following papers:
