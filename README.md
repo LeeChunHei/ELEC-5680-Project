@@ -38,9 +38,9 @@ Result of 512 x 512:
 ![512_512_vid](https://user-images.githubusercontent.com/17170219/168868805-db1cbe66-fc49-457b-9f86-5709549438e8.png)
 
 ### LDPPO vs PPO-Clip
+LDPPO has achieved the same or even better results than the others at ～9.5 parameters, 2300 iteration. The results at iteration 2300 is shown below:
 ![ldppo](https://user-images.githubusercontent.com/17170219/168867137-f238f07b-6f08-49de-a51c-a780efe314e8.png)
-
-![ezgif com-gif-maker(1)](https://user-images.githubusercontent.com/17170219/168870490-fe0b71ac-fd9d-4744-aa26-5804d7e8e1d9.gif)
+![ezgif com-gif-maker(2)](https://user-images.githubusercontent.com/17170219/168871881-e356b75d-581d-4996-af33-9c9ba32d8040.gif)
 
 ### Below is the instruction foor installation of Deep Mimic
 __________________________________________________________________________________________________
