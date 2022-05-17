@@ -7,10 +7,10 @@ We would like to explore humanoid locomotion methods using deep imitation learni
 
 The contribution of our project includes:
 
-1) Explore possiblility of implementing Deep Mimic AMP with deterministic and stochastic off-policy algorithms including TD3 and SAC. 
-2) Explored the existing network settings with different parameters for achieving an optimal performance
-3) Proposed an optimized PPO variant named Leaky Double Critic Proximal Policy Optimization (LDPPO) which can effectively reduce the number of parameters
+1) Proposed an optimized PPO variant named Leaky Double Critic Proximal Policy Optimization (LDPPO) which can effectively reduce the number of parameters
 needed given the same performances while ensuring exploration ability comparing. 
+2) Explore possiblility of implementing Deep Mimic AMP with deterministic and stochastic off-policy algorithms including TD3 and SAC. 
+3) Explored the existing network settings with different parameters for achieving an optimal performance
 4) Generated a stable and human-like enough walking with the algorithms mentioned
 
 ## Results
