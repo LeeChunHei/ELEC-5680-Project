@@ -18,10 +18,15 @@ As it requires a lot of time for training on our limited hardware, the training 
 The result of default settings under this limitation is:
 ![default_vid](https://user-images.githubusercontent.com/17170219/168869160-002c9c92-a693-47d3-a625-4cf551c8db5d.png)
 
+
+
 ### LDPPO vs PPO-Clip
-LDPPO has achieved the same or even better results than the others at ～9.5 parameters, 2300 iteration. The results at iteration 2300 is shown below:
+LDPPO has achieved the same or even better results than the others at ～9.5 parameters, 2300 iteration. 
+The results at iteration 2300 is shown below:
+
 ![ldppo](https://user-images.githubusercontent.com/17170219/168867137-f238f07b-6f08-49de-a51c-a780efe314e8.png)
 ![ezgif com-gif-maker(2)](https://user-images.githubusercontent.com/17170219/168871881-e356b75d-581d-4996-af33-9c9ba32d8040.gif)
+
 
 ### Off-policy Algos: TD3 vs SAC vs PPO under Deep Mimic AMP framework
 ![diff_policy](https://user-images.githubusercontent.com/17170219/168864396-62f8e9de-c8f8-4df9-b70c-f3c62d561a93.png)
