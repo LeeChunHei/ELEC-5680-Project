@@ -3,13 +3,15 @@ import learning.tf_util as TFUtil
 
 NAME = "fc_2layers_gated_1024units"
 
+#orthogonal_initializer()
+
 def build_net(input_tfs, reuse=False):
-    layers = [1024, 512]
+    layers = [1024, 512] #[1024,512]
     gate_common_layers = [128]
     gate_layers = [64]
-    activation = tf.nn.relu
-    weight_init = tf.contrib.layers.xavier_initializer()
-    bias_scale_kernel_init = tf.contrib.layers.xavier_initializer()
+    activation = tf.nn.leaky_relu
+    weight_init = tf.orthogonal_initializer() #tf.contrib.layers.xavier_initializer()
+    bias_scale_kernel_init = tf.orthogonal_initializer() #f.contrib.layers.xavier_initializer()
 
     gate_param_tf = input_tfs[-1] # this should be the goal
     with tf.variable_scope("gate_common", reuse=reuse):

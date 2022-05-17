@@ -1,5 +1,9 @@
 import numpy as np
-import tensorflow as tf
+try:
+  import tensorflow.compat.v1 as tf
+  tf.disable_v2_behavior()
+except Exception:
+  import tensorflow as tf
 import copy
 
 from learning.tf_agent import TFAgent
@@ -145,7 +149,7 @@ class PGAgent(TFAgent):
             std_type = TFDistributionGaussianDiag.StdType.Default
             a_size = self.get_action_size()
 
-            mean_kernel_init = tf.random_uniform_initializer(minval=-init_output_scale, maxval=init_output_scale)
+            mean_kernel_init = tf.orthogonal_initializer() #tf.random_uniform_initializer(minval=-init_output_scale, maxval=init_output_scale)
             mean_bias_init = tf.zeros_initializer()
             logstd_kernel_init = tf.random_uniform_initializer(minval=-init_output_scale, maxval=init_output_scale)
             logstd_bias_init = np.log(self.exp_params_curr.noise) * np.ones(a_size)
@@ -158,15 +162,23 @@ class PGAgent(TFAgent):
 
         return norm_a_pd_tf
     
-    def _build_net_critic(self, net_name, input_tfs, reuse=False):
+    def _build_net_critic(self, net_name, input_tfs, reuse=False,num = 1):
         out_size = 1
-
-        with tf.variable_scope('critic', reuse=reuse):
-            h = NetBuilder.build_net(net_name, input_tfs, reuse)
-            val_tf = tf.layers.dense(inputs=h, units=out_size, activation=None,
-                                    kernel_initializer=tf.contrib.layers.xavier_initializer(),
-                                    reuse=reuse)
-            val_tf = tf.squeeze(val_tf, axis=-1)
+        
+        if(num == 2):
+            with tf.variable_scope('critic2', reuse = reuse):
+                h = NetBuilder.build_net(net_name, input_tfs, reuse)
+                val_tf = tf.layers.dense(inputs=h, units=out_size, activation=None,
+                                        kernel_initializer= tf.glorot_uniform_initializer(),#tf.contrib.layers.xavier_initializer(),
+                                        reuse=reuse)
+                val_tf = tf.squeeze(val_tf, axis=-1)
+        else:    
+            with tf.variable_scope('critic', reuse=reuse):
+                h = NetBuilder.build_net(net_name, input_tfs, reuse)
+                val_tf = tf.layers.dense(inputs=h, units=out_size, activation=None,
+                                        kernel_initializer= tf.orthogonal_initializer(),#tf.contrib.layers.xavier_initializer(),
+                                        reuse=reuse)
+                val_tf = tf.squeeze(val_tf, axis=-1)
 
         return val_tf
     
@@ -218,8 +230,7 @@ class PGAgent(TFAgent):
             a, logp = self._eval_actor(s, g, self._exp_action)
             a = a[0]
             logp = logp[0]
-            #print("mean", a)
-            #print("log", logp)
+
         return a, logp
 
     def _enable_stoch_policy(self):

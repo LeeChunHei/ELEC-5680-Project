@@ -1,14 +1,22 @@
+import time
 import numpy as np
 import copy as copy
-import tensorflow as tf
+try:
+  import tensorflow.compat.v1 as tf
+  tf.disable_v2_behavior()
+except Exception:
+  import tensorflow as tf
 
 from learning.pg_agent import PGAgent
+from learning.tf_agent import TFAgent
 from learning.solvers.mpi_solver import MPISolver
 import learning.tf_util as TFUtil
 import learning.rl_util as RLUtil
+#import learning.nets.fc_2layers_1024units as fc_2layers_1024units
 from util.logger import Logger
 import util.mpi_util as MPIUtil
 import util.math_util as MathUtil
+#from env.action_space import ActionSpace
 from env.env import Env
 
 '''
@@ -72,6 +80,7 @@ class PPOAgent(PGAgent):
         with tf.variable_scope('main'):
             self._norm_a_pd_tf = self._build_net_actor(actor_net_name, self._get_actor_inputs(), actor_init_output_scale)
             self._critic_tf = self._build_net_critic(critic_net_name, self._get_critic_inputs())
+            self._critic2_tf = self._build_net_critic(critic_net_name, self._get_critic_inputs(), num =2)
                 
         if (self._norm_a_pd_tf != None):
             Logger.print("Built actor net: " + actor_net_name)
@@ -96,8 +105,9 @@ class PPOAgent(PGAgent):
         actor_bound_loss_weight = 10.0
         actor_weight_decay = 0 if (self.ACTOR_WEIGHT_DECAY_KEY not in json_data) else json_data[self.ACTOR_WEIGHT_DECAY_KEY]
         critic_weight_decay = 0 if (self.CRITIC_WEIGHT_DECAY_KEY not in json_data) else json_data[self.CRITIC_WEIGHT_DECAY_KEY]
+        entropy_coef = 0.01
         
-        val_diff = self._tar_val_ph - self._critic_tf
+        val_diff = self._tar_val_ph - tf.minimum(self._critic_tf, self._critic2_tf)
         self._critic_loss_tf = 0.5 * tf.reduce_mean(tf.square(val_diff))
 
         if (critic_weight_decay != 0):
@@ -107,7 +117,16 @@ class PPOAgent(PGAgent):
         actor_loss0 = self._adv_ph * ratio_tf
         actor_loss1 = self._adv_ph * tf.clip_by_value(ratio_tf, 1.0 - self.ratio_clip, 1 + self.ratio_clip)
         actor_loss_tf = tf.minimum(actor_loss0, actor_loss1)
-        self._actor_loss_tf = -tf.reduce_mean(actor_loss_tf)
+
+        # Entropy
+        #dist = tf.distributions.Normal(loc=self._norm_a_mean_tf, scale=self.norm_a_std_tf)
+        act_prob = tf.exp(self._a_logp_tf)
+        entropy = -tf.reduce_sum(act_prob * tf.log(tf.clip_by_value(act_prob,1e-10,1)),axis=0)#-tf.reduce_sum(act_prob * self.logp_tf, axis=0)
+        entropy = tf.reduce_mean(entropy)
+    
+        # Add Policy Entropy to actor loss function     
+        self._actor_loss_tf = -(tf.reduce_mean(tf.minimum(actor_loss0, actor_loss1)) + entropy_coef*entropy)
+        #self._actor_loss_tf = -tf.reduce_mean(actor_loss_tf)
         
         # for debugging
         self._clip_frac_tf = tf.reduce_mean(tf.to_float(tf.greater(tf.abs(ratio_tf - 1.0), self.ratio_clip)))
@@ -126,7 +145,7 @@ class PPOAgent(PGAgent):
         critic_stepsize = 0.01 if (self.CRITIC_STEPSIZE_KEY not in json_data) else json_data[self.CRITIC_STEPSIZE_KEY]
         critic_momentum = 0.9 if (self.CRITIC_MOMENTUM_KEY not in json_data) else json_data[self.CRITIC_MOMENTUM_KEY]
         
-        critic_vars = self._tf_vars(self.MAIN_SCOPE + '/critic')
+        critic_vars = self._tf_vars(self.MAIN_SCOPE + '/critic') + self._tf_vars(self.MAIN_SCOPE + '/critic2')
         critic_opt = tf.train.MomentumOptimizer(learning_rate=critic_stepsize, momentum=critic_momentum)
         self._critic_grad_tf = tf.gradients(self._critic_loss_tf, critic_vars)
         self._critic_solver = MPISolver(self.sess, critic_opt, critic_vars)
@@ -137,6 +156,7 @@ class PPOAgent(PGAgent):
         self._actor_solver = MPISolver(self.sess, actor_opt, actor_vars)
         
         return
+
 
     def _train_step(self):
         start_idx = self.replay_buffer.buffer_tail
@@ -308,3 +328,4 @@ class PPOAgent(PGAgent):
         self._actor_solver.update(grads)
 
         return loss, clip_frac
+        
