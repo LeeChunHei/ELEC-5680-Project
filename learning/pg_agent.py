@@ -218,7 +218,8 @@ class PGAgent(TFAgent):
             a, logp = self._eval_actor(s, g, self._exp_action)
             a = a[0]
             logp = logp[0]
-
+            #print("mean", a)
+            #print("log", logp)
         return a, logp
 
     def _enable_stoch_policy(self):

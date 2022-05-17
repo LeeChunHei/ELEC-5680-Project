@@ -28,5 +28,5 @@
 
 --agent_files data/agents/ct_agent_humanoid_amp.txt
 
---output_path output
+--output_path output_256_256_256
 #--int_output_path output/intermediate

@@ -41,7 +41,7 @@
 	"RewardScale": 2,
 
 	"OutputIters": 10,
-	"IntOutputIters": 200,
+	"IntOutputIters": 1,
 	"TestEpisodes": 32,
 
 	"ExpAnnealSamples": 200000000,
