@@ -40,6 +40,7 @@ Result of 512 x 512:
 ### LDPPO vs PPO-Clip
 ![ldppo](https://user-images.githubusercontent.com/17170219/168867137-f238f07b-6f08-49de-a51c-a780efe314e8.png)
 
+![ezgif com-gif-maker(1)](https://user-images.githubusercontent.com/17170219/168870490-fe0b71ac-fd9d-4744-aa26-5804d7e8e1d9.gif)
 
 ### Below is the instruction foor installation of Deep Mimic
 __________________________________________________________________________________________________
