@@ -48,7 +48,7 @@ Result of 512 x 512:
 ![512_512_vid](https://user-images.githubusercontent.com/17170219/168868805-db1cbe66-fc49-457b-9f86-5709549438e8.png)
 
 
-### Below is the instruction foor installation of Deep Mimic
+### Below is the instruction for Deep Mimic installation 
 __________________________________________________________________________________________________
 
 # Intro 
